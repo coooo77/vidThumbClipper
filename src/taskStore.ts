@@ -3,7 +3,7 @@ import { computed, reactive, watch } from 'vue'
 export type TaskKind = 'clip' | 'merge' | 'preprocess' | 'combine'
 export type ClipMethod = 'range' | 'duration' | 'count'
 export type CombineMode = 'copy' | 'reencode'
-export type TaskStatus = '等待中' | '處理中' | '完成' | '失敗'
+export type TaskStatus = '等待中' | '處理中' | '完成' | '失敗' | '已取消'
 
 export interface VideoSegment {
   start: number

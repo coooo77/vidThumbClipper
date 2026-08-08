@@ -157,3 +157,89 @@ Remux／預先處理功能仍然有價值：它能修正縮圖擷取時的時間
 **修法**：建立 `AudioContext` 後檢查 `ctx.state === "suspended"`，是的話先 `resume()`、等它真的恢復了才排程播放，不是就直接播。
 
 **相關檔案**：`notify.ts`（`playTone`）
+
+---
+
+## 12. 初始縮圖的 N × M 格數要包含起點與終點
+
+**症狀**：選擇 4 × 5 建立初始縮圖時，畫面出現 20 張中間縮圖，再加上起點與終點，總共 22 張，超出使用者選定的格數。
+
+**原因**：原本把 `gridCols * gridRows` 全部拿來產生中間縮圖，之後又額外渲染起點與終點。端點其實也是版面中的兩個格子，不能重複加在 N × M 之外。
+
+**修法**：初始中間縮圖數量改成：
+
+```ts
+Math.max(0, gridCols * gridRows - 2)
+```
+
+因此 4 × 5 會產生 18 張中間縮圖，加上起點與終點後正好 20 格。UI 說明文字也要明確標示 N × M 是包含端點的總格數。
+
+**相關檔案**：`Home.vue`（`initialGridSlotCount`、`initialThumbnailCount`、`generateGridThumbnails`）
+
+---
+
+## 13. 起點／終點縮圖不能阻塞初始縮圖與擴充佇列
+
+**症狀**：中間縮圖已完成，但起點／終點沒有畫面；進度文字仍停在「正在擷取起點與終點縮圖…」，擴充按鈕 disabled，或使用者加入的擴充任務一直停在「等待中」。
+
+**原因**：初始流程用 `Promise.all` 等待起點與終點。某些長時間 MP4 在接近容器結尾的位置會讓 ffmpeg 回報 exit code 0 卻輸出空檔，接著 precise seek 又可能長時間掃描；整個 `isProcessing` 因此無法解除。另一方面，起點／終點只是 UI 端點預覽，不應該阻塞已經完成的中間縮圖或擴充任務。
+
+**修法**：
+
+- 中間縮圖完成後立即解除 `isProcessing`，起點／終點改在背景擷取。
+- 起點與終點使用 `Promise.allSettled` 分開處理；其中一張失敗不能讓另一張也消失。
+- 終點不要直接使用 `duration - 0.5`，改用較安全的 `duration - 2`，避免落在最後一個不可解碼的時間戳。
+- 端點擷取失敗只寫入 Home logger，不阻塞擴充功能。
+- 初始流程成功或失敗後都清除進度文字，避免殘留看似仍在處理的狀態。
+
+**相關檔案**：`Home.vue`（`isEndpointProcessing`、`captureEndpointThumbnails`、`generateGridThumbnails`）、`lib.rs`（`capture_single_thumbnail`）
+
+---
+
+## 14. 擴充任務執行中仍要允許加入後續任務
+
+**症狀**：第一個擴充任務執行到一半時，使用者無法再加入其他截圖任務；或任務被加入後停在「等待中」且沒有繼續執行。
+
+**原因**：擴充任務本身是序列佇列，`isExpanding` 代表 worker 正在工作，不代表不能新增等待中的任務。如果把 `isExpanding` 加入「加入截圖任務」按鈕的 disabled 條件，便違反原本的設計。若在 `isProcessing` 期間加入任務，`processExpansionQueue()` 會提早返回，也需要在初始縮圖真正完成後重新啟動佇列。
+
+**修法**：
+
+- 擴充按鈕只在初始縮圖 `isProcessing` 或同一範圍 `isPairLocked` 時停用；`isExpanding` 期間仍可加入其他範圍。
+- `processExpansionQueue()` 使用即時 `find()` 取得下一個「等待中」任務；目前任務完成後會自動接續中途新增的任務。
+- 若舊狀態已經留下等待中的任務，初始縮圖完成後重新呼叫 `processExpansionQueue()`。
+- 沒有可插入時間點時不能靜默標記為完成，必須在 Home logger 顯示原因。
+
+**相關檔案**：`Home.vue`（`queueExpansionJob`、`runExpansionJob`、`processExpansionQueue`）
+
+---
+
+## 15. ffmpeg 截圖 exit code 0 不代表真的產生圖片
+
+**症狀**：ffmpeg 顯示 exit code 0，但輸出檔不存在或是空檔；例如長時間影片接近結尾時出現：`Output file is empty, nothing was encoded`。如果只檢查 exit code，前端會誤以為截圖成功。
+
+**原因**：輸入端 `-ss` 的快速 seek 依賴容器索引與時間戳。在某些 MP4 或異常時間軸中，ffmpeg 可以正常結束，但實際找不到可解碼的畫面。改用輸出端 precise seek 雖然較可靠，卻可能從檔頭掃描很久。
+
+**修法**：`capture_single_thumbnail` 必須同時檢查：
+
+- process exit code 成功；
+- 輸出路徑是檔案；
+- 檔案大小大於 0。
+
+fast seek 失敗時可嘗試 precise seek，但兩種流程都必須有 timeout，並在 timeout 後 kill、wait、join stdout/stderr reader，避免背景程序或 reader thread 殘留。錯誤訊息要包含 fast/precise 兩次嘗試的耗時、exit code、檔案狀態、實際指令與 ffmpeg stderr，讓 Home logger 能直接提供診斷資料。
+
+**相關檔案**：`lib.rs`（`run_with_timeout`、`capture_single_thumbnail`、`thumbnail_attempt_debug`）
+
+---
+
+## 16. 精確 seek 與快速 seek 的使用取捨
+
+**差異**：
+
+- 快速 seek：`-ss` 放在 `-i` 前，速度快，但可能從前一個 keyframe 開始，剪輯起點會有偏移。
+- 精確 seek：`-ss` 放在 `-i` 後，會更接近要求的時間，但長影片需要從前面掃描，速度可能慢很多。
+
+目前剪輯使用 `-c copy`，因此精確 seek 也不等同於逐影格完全精準；若需要真正逐影格精準，必須重新編碼，代價是速度變慢、檔案可能變大或產生畫質差異。
+
+**建議**：一般正常 MP4 使用快速 seek；長時間錄影、TS/remux 後時間軸異常或剪輯起點明顯偏移時，才啟用精確 seek。
+
+**相關檔案**：`Tasks.vue`（`clipRange`、`preciseSeek`）

@@ -9,6 +9,8 @@ const ffmpegPath = ref('')
 const ffprobePath = ref('')
 const outputDirectory = ref(localStorage.getItem('vid_output_directory') || '')
 const running = ref(false)
+const showStopConfirm = ref(false)
+const pendingCancelTaskId = ref<string | null>(null)
 const hasPendingTasks = computed(() => videoTasks.some((task) => task.status === '等待中'))
 
 onMounted(() => {
@@ -43,10 +45,27 @@ async function chooseOutputDirectory() {
     localStorage.setItem('vid_output_directory', selected)
   }
 }
+function requestStopCurrentTask() {
+  showStopConfirm.value = true
+}
+function cancelStopConfirm() {
+  showStopConfirm.value = false
+}
+async function confirmStopCurrentTask() {
+  showStopConfirm.value = false
+  const current = videoTasks.find((task) => task.status === '處理中')
+  if (!current) return
+  pendingCancelTaskId.value = current.id
+  try {
+    await invoke('cancel_current_task')
+  } catch {
+    // The running task's own catch block in runTasks() handles the status update either way.
+  }
+}
 function clearFinishedTasks() {
   for (let index = videoTasks.length - 1; index >= 0; index -= 1) {
     const task = videoTasks[index]
-    if (task.kind !== 'preprocess' && (task.status === '完成' || task.status === '失敗')) videoTasks.splice(index, 1)
+    if (task.kind !== 'preprocess' && (task.status === '完成' || task.status === '失敗' || task.status === '已取消')) videoTasks.splice(index, 1)
   }
 }
 async function chooseTaskOutputDirectory(task: VideoTask) {
@@ -57,10 +76,9 @@ function clearTaskOutputDirectory(task: VideoTask) {
   task.outputDir = ''
 }
 async function clipRange(task: VideoTask, range: VideoSegment, path: string) {
-  const clipDuration = Math.max(0, range.end - range.start).toFixed(3)
   const args = task.preciseSeek
-    ? ['-i', task.source, '-ss', range.start.toFixed(3), '-t', clipDuration, '-c', 'copy', '-y', path]
-    : ['-ss', range.start.toFixed(3), '-i', task.source, '-t', clipDuration, '-c', 'copy', '-y', path]
+    ? ['-i', task.source, '-ss', range.start.toFixed(3), '-to', range.end.toFixed(3), '-c', 'copy', path, '-y']
+    : ['-ss', range.start.toFixed(3), '-i', task.source, '-to', range.end.toFixed(3), '-c', 'copy', path, '-y']
   const ffmpegOutput = await invoke<string>('run_ffmpeg', { ffmpegPath: ffmpegPath.value || null, args })
   const expected = range.end - range.start
   // A truncated/broken copy can still end up with a container header that claims the requested
@@ -164,10 +182,16 @@ async function runTasks() {
         task.message = `已輸出至 ${outputDirectory.value || folderOf(task.source)}`
         if (trigger === 'each') notifyResult(true)
       } catch (error) {
-        task.status = '失敗'
-        task.message = String(error)
-        hadFailure = true
-        if (trigger === 'each') notifyResult(false)
+        if (pendingCancelTaskId.value === task.id) {
+          task.status = '已取消'
+          task.message = '使用者已停止此任務，可能留下不完整的輸出檔案，需要手動清理。'
+          pendingCancelTaskId.value = null
+        } else {
+          task.status = '失敗'
+          task.message = String(error)
+          hadFailure = true
+          if (trigger === 'each') notifyResult(false)
+        }
       }
     }
   } finally {
@@ -184,7 +208,15 @@ async function runTasks() {
         <h2 class="card-title">影片處理任務</h2>
         <div class="task-actions">
           <button class="btn btn-secondary" @click="clearFinishedTasks">清除已完成</button
+          ><button v-if="running" class="btn btn-danger" @click="requestStopCurrentTask">停止執行中的任務</button
           ><button class="btn btn-primary" :disabled="running || !hasPendingTasks" @click="runTasks">{{ running ? '處理中…' : '開始依序執行' }}</button>
+        </div>
+      </div>
+      <div v-if="showStopConfirm" class="stop-confirm">
+        <span>確定要強制停止目前執行中的任務嗎？已經處理的部分可能留下不完整的輸出檔案，此動作無法復原。</span>
+        <div class="stop-confirm-actions">
+          <button class="btn btn-secondary compact" @click="cancelStopConfirm">取消</button
+          ><button class="btn btn-danger compact" @click="confirmStopCurrentTask">確定停止</button>
         </div>
       </div>
       <p class="info">任務會依建立順序執行。原始影片只會被讀取，絕不覆寫。</p>
@@ -291,6 +323,10 @@ async function runTasks() {
   background: rgba(99, 102, 241, 0.25);
   color: #c7d2fe;
 }
+.已取消 {
+  background: rgba(148, 163, 184, 0.2);
+  color: #cbd5e1;
+}
 .message {
   white-space: pre-wrap;
   color: #fca5a5 !important;
@@ -301,6 +337,38 @@ async function runTasks() {
   background: none;
   color: #fca5a5;
   cursor: pointer;
+}
+.btn-danger {
+  background: #7f1d1d;
+  color: #fecaca;
+  border: 0;
+}
+.btn-danger:hover {
+  background: #991b1b;
+}
+.stop-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: -0.5rem 0 1.1rem;
+  padding: 0.8rem 1rem;
+  border-radius: 10px;
+  background: rgba(127, 29, 29, 0.35);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fecaca;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.stop-confirm-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+.compact {
+  padding: 0.45rem 0.75rem;
+  font-size: 0.8rem;
 }
 .task-output-dir {
   display: flex;

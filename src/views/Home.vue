@@ -35,6 +35,7 @@ const ffprobePath = ref('')
 const videoPath = ref('')
 const originalSourcePath = ref('')
 const isProcessing = ref(false)
+const isEndpointProcessing = ref(false)
 const isExpanding = ref(false)
 const isDraggingFile = ref(false)
 const showPreprocessHint = ref(false)
@@ -46,6 +47,8 @@ const progressPercent = ref(0)
 // The visible layout is always editable. Rows are increased automatically when more images are inserted.
 const gridCols = ref(7)
 const gridRows = ref(5)
+const initialGridSlotCount = computed(() => Math.max(1, Math.floor(Number(gridCols.value) || 1) * Math.floor(Number(gridRows.value) || 1)))
+const initialThumbnailCount = computed(() => Math.max(0, initialGridSlotCount.value - 2))
 const thumbnails = ref<ThumbnailItem[]>([])
 const startThumbnail = ref<string | null>(null)
 const endThumbnail = ref<string | null>(null)
@@ -303,7 +306,7 @@ function loadVideoFromPath(path: string) {
 }
 
 async function selectVideo() {
-  if (isProcessing.value || isExpanding.value) return addLog('目前有縮圖正在處理，請等待完成後再切換影片。')
+  if (isProcessing.value || isEndpointProcessing.value || isExpanding.value) return addLog('目前有縮圖正在處理，請等待完成後再切換影片。')
   const selected = await open({
     multiple: false,
     directory: false,
@@ -317,7 +320,7 @@ async function selectVideo() {
 // Dropped files aren't extension-checked here — anything can be dropped, and if ffprobe/ffmpeg can't
 // actually parse it as a video, that surfaces as a clear error toast once thumbnail capture runs.
 function handleDroppedVideo(path: string) {
-  if (isProcessing.value || isExpanding.value) return addLog('目前有縮圖正在處理，請等待完成後再切換影片。')
+  if (isProcessing.value || isEndpointProcessing.value || isExpanding.value) return addLog('目前有縮圖正在處理，請等待完成後再切換影片。')
   activePanel.value = 'load'
   loadVideoFromPath(path)
 }
@@ -363,7 +366,7 @@ function queuePreprocessTasks(paths: string[]) {
 
 function useProcessedVideo(task: VideoTask) {
   if (!task.resultPath) return
-  if (isProcessing.value || isExpanding.value) return addLog('目前有縮圖正在處理，請等待完成後再切換影片。')
+  if (isProcessing.value || isEndpointProcessing.value || isExpanding.value) return addLog('目前有縮圖正在處理，請等待完成後再切換影片。')
   loadPaths()
   videoPath.value = task.resultPath
   originalSourcePath.value = task.source
@@ -397,7 +400,10 @@ async function captureAtTimes(times: number[], offset: number, shouldStop?: () =
   const result: ThumbnailItem[] = []
   for (let i = 0; i < times.length; i += 1) {
     if (shouldStop && shouldStop()) break
-    progressPercent.value = Math.round(((i + 1) / times.length) * 100)
+    // Do not show 100% until the awaited backend capture has actually returned. Previously the
+    // last item displayed "40/40 (100%)" while ffmpeg could still be blocked, which made it look
+    // safe to start an expansion even though isProcessing was still true.
+    progressPercent.value = Math.round((i / times.length) * 100)
     progressText.value = `正在擷取 ${i + 1}/${times.length} 張（${progressPercent.value}%）`
     const base64 = await invoke<string>('capture_single_thumbnail', {
       ffmpegPath: ffmpegPath.value || null,
@@ -406,6 +412,8 @@ async function captureAtTimes(times: number[], offset: number, shouldStop?: () =
       index: offset + i,
     })
     result.push({ time: times[i], timeStr: formatSeconds(times[i]), base64: `data:image/jpeg;base64,${base64}` })
+    progressPercent.value = Math.round(((i + 1) / times.length) * 100)
+    progressText.value = `已完成擷取 ${i + 1}/${times.length} 張（${progressPercent.value}%）`
   }
   return result
 }
@@ -413,33 +421,66 @@ async function captureAtTimes(times: number[], offset: number, shouldStop?: () =
 async function generateGridThumbnails() {
   if (!videoPath.value) return addLog('請先選擇影片檔案。')
   updateLayoutFromUser()
-  const count = gridCols.value * gridRows.value
+  // The selected N × M layout includes the two endpoint cells. Only the remaining cells need
+  // regular timeline captures; otherwise a 4 × 5 layout incorrectly renders 22 images.
+  const count = initialThumbnailCount.value
   loadPaths()
   isProcessing.value = true
   thumbnails.value = []
+  startThumbnail.value = null
+  endThumbnail.value = null
   selectedTimes.value = []
+  let initialCaptureSucceeded = false
+  let duration = 0
   try {
-    const duration = await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: videoPath.value })
+    duration = await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: videoPath.value })
     videoDuration.value = duration
     const times = Array.from({ length: count }, (_, index) => ((index + 1) * duration) / (count + 1))
     thumbnails.value = await captureAtTimes(times, 0)
     normaliseLayout()
-    const [startShot, endShot] = await Promise.all([
-      invoke<string>('capture_single_thumbnail', { ffmpegPath: ffmpegPath.value || null, videoPath: videoPath.value, time: '0.000', index: -1 }),
-      invoke<string>('capture_single_thumbnail', {
-        ffmpegPath: ffmpegPath.value || null,
-        videoPath: videoPath.value,
-        time: Math.max(0, duration - 0.5).toFixed(3),
-        index: -2,
-      }),
-    ])
-    startThumbnail.value = `data:image/jpeg;base64,${startShot}`
-    endThumbnail.value = `data:image/jpeg;base64,${endShot}`
-    addLog(`已建立 ${thumbnails.value.length} 張縮圖。`)
+    initialCaptureSucceeded = true
+    addLog(`已建立 ${thumbnails.value.length} 張中間縮圖，起點與終點將在背景擷取。`)
   } catch (error) {
     addLog(`擷取失敗：${String(error)}`)
   } finally {
     isProcessing.value = false
+    progressText.value = ''
+    progressPercent.value = 0
+    // If an older UI state queued an expansion while the initial capture was still running,
+    // resume it now that the source thumbnails are genuinely ready.
+    if (initialCaptureSucceeded && expansionQueue.value.some((job) => job.status === '等待中')) processExpansionQueue()
+    if (initialCaptureSucceeded) void captureEndpointThumbnails(duration)
+  }
+}
+
+async function captureEndpointThumbnails(duration: number) {
+  isEndpointProcessing.value = true
+  addLog('開始背景擷取起點與終點縮圖；這不會阻塞擴充佇列。')
+  try {
+    const endpointResults = await Promise.allSettled([
+      invoke<string>('capture_single_thumbnail', {
+        ffmpegPath: ffmpegPath.value || null,
+        videoPath: videoPath.value,
+        time: '0.000',
+        index: -1,
+      }),
+      invoke<string>('capture_single_thumbnail', {
+        ffmpegPath: ffmpegPath.value || null,
+        videoPath: videoPath.value,
+        // Stay a little farther inside the file than the container's reported end. Some long MP4s
+        // report a final timestamp for which input-side seek produces an empty image.
+        time: Math.max(0, duration - 2).toFixed(3),
+        index: -2,
+      }),
+    ])
+    const [startResult, endResult] = endpointResults
+    if (startResult.status === 'fulfilled') startThumbnail.value = `data:image/jpeg;base64,${startResult.value}`
+    else addLog(`起點縮圖擷取失敗：${String(startResult.reason)}`)
+    if (endResult.status === 'fulfilled') endThumbnail.value = `data:image/jpeg;base64,${endResult.value}`
+    else addLog(`終點縮圖擷取失敗：${String(endResult.reason)}`)
+    if (startResult.status === 'fulfilled' && endResult.status === 'fulfilled') addLog('起點與終點縮圖已完成。')
+  } finally {
+    isEndpointProcessing.value = false
   }
 }
 
@@ -492,10 +533,17 @@ function indexForTime(time: number): number {
 }
 
 function queueExpansionJob() {
+  if (isProcessing.value) return addLog('初始縮圖仍在處理中，請等進度完成後再加入擴充任務。')
   if (!selectedPairIsAdjacent.value || !selectedPair.value) return addLog('請選擇兩張相鄰的縮圖後再加入截圖任務。')
   if (isPairLocked.value) return addLog('這個範圍正在截圖佇列中，請等待完成後再選取。')
   const start = startTime.value
   const end = endTime.value
+  const interval = Math.max(1, Math.floor(Number(expansionInterval.value) || 1))
+  if ((expansionMode.value === 'interval' || expansionMode.value === 'single') && end - start <= interval) {
+    return addLog(
+      `無法加入截圖任務：選取範圍只有 ${formatSeconds(end - start)}，不超過目前設定的 ${interval} 秒，因此沒有可插入的時間點。請選擇更大的範圍或較小的秒數。`,
+    )
+  }
   const job: ExpansionJob = {
     id: newTaskId(),
     anchorStartTime: start,
@@ -554,8 +602,12 @@ watch(
 async function runExpansionJob(job: ExpansionJob) {
   const times = buildTimesForJob(job)
   if (!times.length) {
-    job.message = '沒有符合條件的新時間點'
-    return
+    const span = Math.max(0, job.anchorEndTime - job.anchorStartTime)
+    const interval = Math.max(1, Math.floor(Number(job.interval) || 1))
+    const message = `沒有符合條件的新時間點（範圍 ${formatSeconds(span)}，設定 ${interval} 秒）`
+    job.message = message
+    addLog(`擴充失敗（${job.label}）：${message}`)
+    throw new Error(message)
   }
   const insertAt = indexForTime(job.anchorEndTime)
   const additions = await captureAtTimes(times, thumbnails.value.length, () => job.cancelRequested)
@@ -590,6 +642,8 @@ async function processExpansionQueue() {
     }
   } finally {
     isExpanding.value = false
+    progressText.value = ''
+    progressPercent.value = 0
   }
 }
 
@@ -790,8 +844,8 @@ function createCombineTask() {
             <div class="col input-group"><label>欄（N）</label><input v-model.number="gridCols" type="number" min="1" @change="updateLayoutFromUser" /></div>
             <div class="col input-group"><label>列（M）</label><input v-model.number="gridRows" type="number" min="1" @change="updateLayoutFromUser" /></div>
           </div>
-          <p class="info-text">初始擷取 {{ gridCols * gridRows }} 張；之後可隨時自行改為任意 N × M 排列。</p>
-          <button class="btn btn-primary btn-glow w-full" :disabled="isProcessing || isExpanding" @click="generateGridThumbnails">
+          <p class="info-text">初始擷取 {{ initialThumbnailCount }} 張中間縮圖，連同起點與終點共 {{ initialGridSlotCount }} 格；之後可隨時自行改為任意 N × M 排列。</p>
+          <button class="btn btn-primary btn-glow w-full" :disabled="isProcessing || isEndpointProcessing || isExpanding" @click="generateGridThumbnails">
             {{ isProcessing ? '處理中…' : '建立縮圖' }}
           </button>
         </div>
@@ -826,7 +880,13 @@ function createCombineTask() {
             }}
           </p>
           <p v-else class="selection-summary muted">尚未選擇兩張相鄰縮圖</p>
-          <button class="btn btn-primary w-full" :disabled="!selectedPairIsAdjacent || isPairLocked" @click="queueExpansionJob">加入截圖任務</button>
+          <button
+            class="btn btn-primary w-full"
+            :disabled="isProcessing || isPairLocked"
+            @click="queueExpansionJob"
+          >
+            加入截圖任務
+          </button>
           <div v-if="expansionQueue.length" class="expansion-queue">
             <div class="expansion-queue-header">
               <span>截圖佇列（{{ expansionQueue.length }}）</span

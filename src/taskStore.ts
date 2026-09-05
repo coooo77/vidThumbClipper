@@ -31,9 +31,26 @@ export interface VideoTask {
 }
 
 const storageKey = 'vid_thumb_clipper_tasks'
+
+export function normaliseVideoPath(path: string) {
+  return path.replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase()
+}
+
+function deduplicatePreprocessTasks(tasks: VideoTask[]) {
+  const seenSources = new Set<string>()
+  return tasks.filter((task) => {
+    if (task.kind !== 'preprocess') return true
+    const sourceKey = normaliseVideoPath(task.source)
+    if (seenSources.has(sourceKey)) return false
+    seenSources.add(sourceKey)
+    return true
+  })
+}
+
 let initialTasks: VideoTask[] = []
 try {
-  initialTasks = JSON.parse(localStorage.getItem(storageKey) || '[]') as VideoTask[]
+  const storedTasks = JSON.parse(localStorage.getItem(storageKey) || '[]') as VideoTask[]
+  initialTasks = deduplicatePreprocessTasks(storedTasks)
 } catch {
   initialTasks = []
 }
@@ -47,4 +64,13 @@ export function newTaskId() {
 }
 
 // Preprocess tasks that finished successfully — selectable back on the Home page as a video source.
-export const processedVideos = computed(() => videoTasks.filter((task) => task.kind === 'preprocess' && task.status === '完成'))
+export const processedVideos = computed(() => {
+  const seenSources = new Set<string>()
+  return videoTasks.filter((task) => {
+    if (task.kind !== 'preprocess' || task.status !== '完成') return false
+    const sourceKey = normaliseVideoPath(task.source)
+    if (seenSources.has(sourceKey)) return false
+    seenSources.add(sourceKey)
+    return true
+  })
+})

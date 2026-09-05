@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useRouter } from 'vue-router'
-import { newTaskId, processedVideos, videoTasks, type ClipMethod, type CombineMode, type TaskKind, type VideoSegment, type VideoTask } from '../taskStore'
+import { newTaskId, normaliseVideoPath, processedVideos, videoTasks, type ClipMethod, type CombineMode, type TaskKind, type VideoSegment, type VideoTask } from '../taskStore'
 
 interface ThumbnailItem {
   time: number
@@ -95,7 +95,7 @@ const taskOutputName = ref('processed_video')
 const taskOutputNameAuto = ref(true)
 const taskExtension = ref('mp4')
 const taskExtraArgs = ref('')
-const taskPreciseSeek = ref(false)
+const taskPreciseSeek = ref(true)
 const taskKeepSegments = ref(false)
 
 // Requires exactly two ADJACENT thumbnails (by CURRENT array position — resolved live, since another
@@ -338,7 +338,20 @@ async function selectVideosForPreprocessing() {
 }
 
 function queuePreprocessTasks(paths: string[]) {
-  for (const path of paths) {
+  const seenSources = new Set<string>()
+  const pathsToQueue = paths.filter((path) => {
+    const source = path.trim()
+    if (!source) return false
+    const sourceKey = normaliseVideoPath(source)
+    if (seenSources.has(sourceKey)) return false
+    seenSources.add(sourceKey)
+
+    // Selecting the same file again while an existing preprocess task is still in the queue
+    // would create the same output twice. Keep one task per source instead.
+    return !videoTasks.some((task) => task.kind === 'preprocess' && normaliseVideoPath(task.source) === sourceKey)
+  })
+
+  for (const path of pathsToQueue) {
     videoTasks.push({
       id: newTaskId(),
       kind: 'preprocess',
@@ -360,7 +373,11 @@ function queuePreprocessTasks(paths: string[]) {
       message: '',
     })
   }
-  addLog(`已加入 ${paths.length} 筆預先處理任務，前往「影片處理任務」執行。`)
+  if (!pathsToQueue.length) {
+    addLog('選取的影片都已在預先處理佇列中。')
+    return
+  }
+  addLog(`已加入 ${pathsToQueue.length} 筆預先處理任務，前往「影片處理任務」執行。`)
   router.push('/tasks')
 }
 

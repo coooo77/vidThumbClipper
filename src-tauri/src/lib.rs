@@ -138,6 +138,23 @@ fn clear_thumbnail_cache() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn delete_file(path: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Unable to delete file: path is empty".to_string());
+    }
+
+    let path = PathBuf::from(trimmed);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        // A missing output is already in the desired state, so stale task records can still be
+        // removed from the processed-video list.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Unable to delete file '{}': {error}", path.display())),
+    }
+}
+
+#[tauri::command]
 fn get_file_size(path: String) -> Result<u64, String> {
     std::fs::metadata(&path)
         .map(|meta| meta.len())
@@ -481,6 +498,7 @@ pub fn run() {
             capture_single_thumbnail,
             get_thumbnail_cache_dir,
             clear_thumbnail_cache,
+            delete_file,
             get_file_size,
             concat_videos,
             cancel_current_task

@@ -14,6 +14,7 @@ interface ThumbnailItem {
 
 type ExpansionMode = 'interval' | 'single' | 'grid'
 type QueueStatus = '等待中' | '處理中' | '完成' | '失敗' | '已取消'
+type ModalImageSize = 'fit' | 'original'
 
 interface ExpansionJob {
   id: string
@@ -53,6 +54,7 @@ const thumbnails = ref<ThumbnailItem[]>([])
 const startThumbnail = ref<string | null>(null)
 const endThumbnail = ref<string | null>(null)
 const activeModalIndex = ref<number | null>(null)
+const modalImageSize = ref<ModalImageSize>('fit')
 const selectedTimes = ref<number[]>([])
 const expansionMode = ref<ExpansionMode>('interval')
 const expansionInterval = ref(1)
@@ -67,8 +69,10 @@ const combineDragFromIndex = ref<number | null>(null)
 const combineMode = ref<CombineMode>('copy')
 const combineOutputName = ref('merged_video')
 const combineExtension = ref('mp4')
-const loadSubPanel = ref<'init' | 'expand'>('init')
+const loadSubPanel = ref<'source' | 'init' | 'expand'>('source')
 const logOpen = ref(false)
+const showDeleteProcessedConfirm = ref(false)
+const isDeletingProcessed = ref(false)
 const router = useRouter()
 const taskKind = ref<TaskKind>('clip')
 const taskSourceMode = ref<'original' | 'processed'>('original')
@@ -248,6 +252,16 @@ function clearLogs() {
   logs.value = []
 }
 
+function openModal(index: number) {
+  if (index < 0 || index >= modalSequence.value.length) return
+  modalImageSize.value = 'fit'
+  activeModalIndex.value = index
+}
+
+function toggleModalImageSize() {
+  modalImageSize.value = modalImageSize.value === 'fit' ? 'original' : 'fit'
+}
+
 function modalGoPrev() {
   if (activeModalIndex.value === null || activeModalIndex.value <= 0) return
   activeModalIndex.value -= 1
@@ -408,8 +422,105 @@ function removeProcessedVideo(id: string) {
 }
 
 function clearProcessedVideos() {
+  showDeleteProcessedConfirm.value = false
   for (let index = videoTasks.length - 1; index >= 0; index -= 1) {
     if (videoTasks[index].kind === 'preprocess' && videoTasks[index].status === '完成') videoTasks.splice(index, 1)
+  }
+}
+
+function requestDeleteAllProcessedVideos() {
+  if (!processedVideos.value.length) return
+  if (isProcessing.value || isEndpointProcessing.value || isExpanding.value) {
+    addLog('目前有縮圖正在處理，請等待完成後再刪除已處理影片。')
+    return
+  }
+  showDeleteProcessedConfirm.value = true
+}
+
+function cancelDeleteAllProcessedVideos() {
+  showDeleteProcessedConfirm.value = false
+}
+
+function resetThumbnailPreview() {
+  thumbnails.value = []
+  startThumbnail.value = null
+  endThumbnail.value = null
+  videoDuration.value = 0
+  expansionQueue.value = []
+  selectedTimes.value = []
+  progressText.value = ''
+  progressPercent.value = 0
+}
+
+async function deleteAllProcessedVideos() {
+  if (isDeletingProcessed.value) return
+  showDeleteProcessedConfirm.value = false
+
+  const tasksToDelete = videoTasks.filter((task) => task.kind === 'preprocess' && task.status === '完成')
+  if (!tasksToDelete.length) return
+
+  isDeletingProcessed.value = true
+  const pathsByKey = new Map<string, string>()
+  const failures: string[] = []
+  const sourceKeys = new Set(tasksToDelete.map((task) => normaliseVideoPath(task.source)))
+
+  for (const task of tasksToDelete) {
+    const displayName = `${task.outputName}.${task.extension}`
+    const resultPath = task.resultPath.trim()
+    if (!resultPath) {
+      failures.push(`${displayName}（沒有輸出檔案路徑）`)
+      continue
+    }
+    const resultKey = normaliseVideoPath(resultPath)
+    if (sourceKeys.has(resultKey)) {
+      failures.push(`${displayName}（輸出檔案路徑與原始影片相同，為避免誤刪已略過）`)
+      continue
+    }
+    if (!pathsByKey.has(resultKey)) pathsByKey.set(resultKey, resultPath)
+  }
+
+  const deletedPathKeys = new Set<string>()
+  try {
+    for (const [pathKey, path] of pathsByKey) {
+      try {
+        await invoke('delete_file', { path })
+        deletedPathKeys.add(pathKey)
+      } catch (error) {
+        failures.push(`${path}（${String(error)}）`)
+      }
+    }
+
+    let removedTaskCount = 0
+    for (let index = videoTasks.length - 1; index >= 0; index -= 1) {
+      const task = videoTasks[index]
+      if (task.kind !== 'preprocess' || task.status !== '完成') continue
+      const resultPath = task.resultPath.trim()
+      if (resultPath && !deletedPathKeys.has(normaliseVideoPath(resultPath))) continue
+      if (!resultPath && failures.some((failure) => failure.startsWith(`${task.outputName}.${task.extension}（`))) continue
+      videoTasks.splice(index, 1)
+      removedTaskCount += 1
+    }
+
+    const currentPathKey = normaliseVideoPath(videoPath.value)
+    if (deletedPathKeys.has(currentPathKey)) {
+      const deletedTask = tasksToDelete.find((task) => normaliseVideoPath(task.resultPath) === currentPathKey)
+      const fallbackPath = deletedTask?.source || (normaliseVideoPath(originalSourcePath.value) !== currentPathKey ? originalSourcePath.value : '')
+      videoPath.value = fallbackPath
+      originalSourcePath.value = fallbackPath
+      taskSourceMode.value = 'original'
+      taskSourceProcessedId.value = ''
+      resetThumbnailPreview()
+      addLog(fallbackPath ? '目前載入的已處理影片已刪除，已切回原始影片。' : '目前載入的已處理影片已刪除，請重新選擇影片。')
+    }
+
+    if (failures.length) {
+      addLog(`已刪除 ${deletedPathKeys.size} 個已處理影片檔案，另有 ${failures.length} 個項目刪除失敗，已保留在清單中。`)
+      for (const failure of failures) addLog(`刪除失敗：${failure}`)
+    } else {
+      addLog(`已刪除全部已處理影片檔案，共 ${deletedPathKeys.size} 個檔案，並清除 ${removedTaskCount} 筆紀錄。`)
+    }
+  } finally {
+    isDeletingProcessed.value = false
   }
 }
 
@@ -816,47 +927,65 @@ function createCombineTask() {
         <button class="panel-tab" :class="{ active: activePanel === 'combine' }" @click="activePanel = 'combine'">合併影片</button>
       </div>
 
-      <section v-if="activePanel === 'load'" class="card">
-        <div class="subsection">
-          <h3 class="subsection-title">影片來源</h3>
-          <div class="input-group no-bottom" :class="{ 'drop-target': isDraggingFile }">
-            <label>影片檔案</label>
-            <div class="input-with-btn">
-              <input v-model="videoPath" placeholder="請選擇影片，或將影片檔案拖曳到視窗中" readonly /><button class="btn btn-secondary" @click="selectVideo">
-                選擇影片
-              </button>
-            </div>
-            <p class="field-hint">也可以直接把影片檔案拖曳到這個視窗中載入。</p>
-          </div>
-          <div class="preprocess-row">
-            <button class="btn btn-secondary compact" @click="selectVideosForPreprocessing">選擇影片進行預先處理（可多選）</button>
-            <div class="info-hint-wrap" ref="infoHintWrap">
-              <button type="button" class="info-hint" @click="showPreprocessHint = !showPreprocessHint">說明</button>
-              <div v-if="showPreprocessHint" class="info-popover">
-                若擷取的秒數跟原始影片對不上，可以多選幾支影片加入預先處理（remux 成 mp4，修正時間軸），到「影片處理任務」執行後回來這裡選用。
+      <section
+        v-if="activePanel === 'load'"
+        class="card load-panel-card"
+        :class="{ 'initial-mode': loadSubPanel === 'init', 'has-processed-videos': processedVideos.length > 0 }"
+      >
+        <div class="panel-tabs sub-tabs">
+          <button type="button" class="panel-tab" :class="{ active: loadSubPanel === 'source' }" @click="loadSubPanel = 'source'">影片檔案</button>
+          <button type="button" class="panel-tab" :class="{ active: loadSubPanel === 'init' }" @click="loadSubPanel = 'init'">建立初始縮圖</button>
+          <button type="button" class="panel-tab" :class="{ active: loadSubPanel === 'expand' }" @click="loadSubPanel = 'expand'">
+            <span>擴充縮圖</span><span v-if="expansionQueue.length" class="sub-tab-count">{{ expansionQueue.length }}</span>
+          </button>
+        </div>
+
+          <div v-if="loadSubPanel === 'source'" class="load-panel-source-area">
+            <div class="subsection source-section">
+              <div class="input-group no-bottom" :class="{ 'drop-target': isDraggingFile }">
+                <div class="video-path-row">
+                  <div class="video-path-display" :title="videoPath">{{ videoPath || '請選擇影片，或將影片檔案拖曳到視窗中' }}</div>
+                </div>
+                <div class="source-actions-row">
+                  <button class="btn btn-secondary compact" @click="selectVideo">選擇影片</button>
+                  <button class="btn btn-secondary compact" title="選擇影片進行預先處理（可多選）" @click="selectVideosForPreprocessing">選擇影片預先處理</button>
+                  <div class="info-hint-wrap" ref="infoHintWrap">
+                    <button type="button" class="info-hint" @click="showPreprocessHint = !showPreprocessHint">說明</button>
+                    <div v-if="showPreprocessHint" class="info-popover">
+                      若擷取的秒數跟原始影片對不上，可以多選幾支影片加入預先處理（remux 成 mp4，修正時間軸），到「影片處理任務」執行後回來這裡選用。
+                    </div>
+                  </div>
+                </div>
+                <p class="field-hint">也可以直接把影片檔案拖曳到這個視窗中載入。</p>
               </div>
-            </div>
           </div>
           <div v-if="processedVideos.length" class="processed-list">
             <div class="processed-list-header">
-              <span>已處理影片（{{ processedVideos.length }}）</span><button class="btn-clear" @click="clearProcessedVideos">清除全部</button>
+              <span>已處理影片（{{ processedVideos.length }}）</span>
+              <div class="processed-list-actions">
+                <button class="btn-clear" @click="clearProcessedVideos">清除全部</button>
+                <button class="btn btn-danger compact" :disabled="isDeletingProcessed" @click="requestDeleteAllProcessedVideos">刪除全部</button>
+              </div>
             </div>
-            <div v-for="task in processedVideos" :key="task.id" class="processed-item">
-              <span class="processed-name" :title="task.resultPath">{{ task.outputName }}.{{ task.extension }}</span>
-              <button class="btn btn-primary compact" @click="useProcessedVideo(task)">使用</button>
-              <button class="btn-clear" @click="removeProcessedVideo(task.id)">移除</button>
+            <div v-if="showDeleteProcessedConfirm" class="processed-delete-confirm">
+              <span>確定要刪除全部已處理影片嗎？實際影片檔案也會刪除，且無法復原。</span>
+              <div class="processed-delete-confirm-actions">
+                <button class="btn btn-secondary compact" @click="cancelDeleteAllProcessedVideos">取消</button>
+                <button class="btn btn-danger compact" @click="deleteAllProcessedVideos">確定刪除</button>
+              </div>
+            </div>
+            <div class="processed-items">
+              <div v-for="task in processedVideos" :key="task.id" class="processed-item">
+                <span class="processed-name" :title="task.resultPath">{{ task.outputName }}.{{ task.extension }}</span>
+                <button class="btn btn-primary compact" @click="useProcessedVideo(task)">使用</button>
+                <button class="btn-clear" @click="removeProcessedVideo(task.id)">移除</button>
+              </div>
             </div>
           </div>
         </div>
 
-        <hr class="divider" />
-
-        <div class="panel-tabs sub-tabs">
-          <button class="panel-tab" :class="{ active: loadSubPanel === 'init' }" @click="loadSubPanel = 'init'">建立初始縮圖</button>
-          <button class="panel-tab" :class="{ active: loadSubPanel === 'expand' }" @click="loadSubPanel = 'expand'">擴充兩張縮圖之間</button>
-        </div>
-
-        <div v-if="loadSubPanel === 'init'" class="subsection">
+        <div v-if="loadSubPanel !== 'source'" class="load-panel-capture-area">
+          <div v-if="loadSubPanel === 'init'" class="subsection capture-section">
           <div class="row">
             <div class="col input-group"><label>欄（N）</label><input v-model.number="gridCols" type="number" min="1" @change="updateLayoutFromUser" /></div>
             <div class="col input-group"><label>列（M）</label><input v-model.number="gridRows" type="number" min="1" @change="updateLayoutFromUser" /></div>
@@ -867,7 +996,7 @@ function createCombineTask() {
           </button>
         </div>
 
-        <div v-else class="subsection">
+        <div v-else class="subsection capture-section expansion-section">
           <p class="info-text">在右側依序選擇兩張相鄰縮圖，再選擇插入方式。</p>
           <div class="mode-row">
             <label><input v-model="expansionMode" type="radio" value="interval" /> 固定秒數</label
@@ -926,9 +1055,10 @@ function createCombineTask() {
           </div>
         </div>
 
-        <div v-if="progressText" class="progress-container">
-          <div class="progress-bar-bg"><div class="progress-bar-fill" :style="{ width: `${progressPercent}%` }"></div></div>
-          <div class="progress-text">{{ progressText }}</div>
+          <div v-if="progressText" class="progress-container">
+            <div class="progress-bar-bg"><div class="progress-bar-fill" :style="{ width: `${progressPercent}%` }"></div></div>
+            <div class="progress-text">{{ progressText }}</div>
+          </div>
         </div>
       </section>
 
@@ -1071,7 +1201,7 @@ function createCombineTask() {
             class="grid-item-img endpoint"
             :class="{ selected: selectedTimes.includes(0), 'in-segment': mergeSegments.length > 0 && isInMergeSegment(0), locked: lockedTimeSet.has(0) }"
             @click="toggleSelection(0)"
-            @dblclick="startThumbnail && (activeModalIndex = 0)"
+            @dblclick="startThumbnail && openModal(0)"
           >
             <div class="img-wrapper"><img v-if="startThumbnail" :src="startThumbnail" alt="起點" /><span class="endpoint-label">起點</span></div>
             <div class="time-tag">00:00:00</div>
@@ -1086,7 +1216,7 @@ function createCombineTask() {
               locked: lockedTimeSet.has(item.time),
             }"
             @click="toggleSelection(item.time)"
-            @dblclick="activeModalIndex = (startThumbnail ? 1 : 0) + index"
+            @dblclick="openModal((startThumbnail ? 1 : 0) + index)"
           >
             <div class="img-wrapper"><img :src="item.base64" :alt="`縮圖 ${item.timeStr}`" /></div>
             <div class="time-tag">{{ item.timeStr }}</div>
@@ -1099,7 +1229,7 @@ function createCombineTask() {
               locked: lockedTimeSet.has(videoDuration),
             }"
             @click="toggleSelection(videoDuration)"
-            @dblclick="endThumbnail && (activeModalIndex = modalSequence.length - 1)"
+            @dblclick="endThumbnail && openModal(modalSequence.length - 1)"
           >
             <div class="img-wrapper"><img v-if="endThumbnail" :src="endThumbnail" alt="終點" /><span class="endpoint-label">終點</span></div>
             <div class="time-tag">{{ formatSeconds(videoDuration) }}</div>
@@ -1112,12 +1242,19 @@ function createCombineTask() {
       <button class="modal-close-btn" @click="activeModalIndex = null">×</button>
       <div class="modal-main">
         <button class="modal-nav-btn modal-nav-prev" :disabled="activeModalIndex === 0" @click.stop="modalGoPrev">‹</button>
-        <div class="modal-content-scroller">
+        <div class="modal-content-scroller" :class="{ 'fit-mode': modalImageSize === 'fit' }">
           <div class="modal-time-label">{{ activeModalItem.label }}</div>
-          <img :src="activeModalItem.src" class="original-size-img" alt="原始縮圖" />
+          <div class="modal-image-viewport">
+            <img :src="activeModalItem.src" class="original-size-img" alt="原始縮圖" />
+          </div>
         </div>
         <button class="modal-nav-btn modal-nav-next" :disabled="activeModalIndex === modalSequence.length - 1" @click.stop="modalGoNext">›</button>
-        <button class="modal-filmstrip-toggle" @click="filmstripVisible = !filmstripVisible">{{ filmstripVisible ? '隱藏縮圖列 ▾' : '顯示縮圖列 ▸' }}</button>
+        <div class="modal-display-controls">
+          <button class="modal-image-size-toggle" :aria-pressed="modalImageSize === 'fit'" @click.stop="toggleModalImageSize">
+            {{ modalImageSize === 'fit' ? '原始大小' : '貼合容器' }}
+          </button>
+          <button class="modal-filmstrip-toggle" @click.stop="filmstripVisible = !filmstripVisible">{{ filmstripVisible ? '隱藏縮圖列 ▾' : '顯示縮圖列 ▸' }}</button>
+        </div>
       </div>
       <div v-if="filmstripVisible" class="modal-filmstrip">
         <div
@@ -1163,12 +1300,16 @@ function createCombineTask() {
   display: grid;
   grid-template-columns: minmax(300px, 390px) minmax(0, 1fr);
   gap: 1.25rem;
+  min-height: 0;
+  min-width: 0;
 }
 .settings-panel,
 .preview-log-panel {
   display: flex;
   flex-direction: column;
   gap: 1.25rem;
+  min-height: 0;
+  min-width: 0;
 }
 .settings-panel {
   position: relative;
@@ -1184,11 +1325,30 @@ function createCombineTask() {
 }
 .panel-tabs.sub-tabs {
   margin-bottom: 1.1rem;
-  padding: 0.2rem;
+  padding: 0.3rem;
 }
 .panel-tabs.sub-tabs .panel-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  min-width: 0;
   font-size: 0.82rem;
   padding: 0.5rem 0.4rem;
+  white-space: nowrap;
+}
+.sub-tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.15rem;
+  height: 1.15rem;
+  padding: 0 0.25rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  color: #e0e7ff;
+  font-size: 0.7rem;
+  line-height: 1;
 }
 .panel-tab {
   flex: 1;
@@ -1209,6 +1369,65 @@ function createCombineTask() {
   background: var(--primary-color);
   color: #fff;
 }
+.load-panel-card {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 0;
+  min-width: 0;
+  padding-top: 0.75rem;
+  padding-bottom: 0.75rem;
+  overflow: hidden;
+}
+.load-panel-card:not(.has-processed-videos) {
+  flex: 0 0 auto;
+}
+.load-panel-card > .panel-tabs.sub-tabs {
+  flex: 0 0 auto;
+  margin: 0;
+}
+.source-section {
+  flex: 0 0 auto;
+  min-height: 0;
+  min-width: 0;
+}
+.load-panel-source-area {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+.load-panel-card:not(.has-processed-videos) .load-panel-source-area {
+  flex: 0 0 auto;
+}
+.capture-section {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+.load-panel-capture-area {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.expansion-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.load-panel-card:not(.has-processed-videos) .load-panel-capture-area {
+  flex: 0 0 auto;
+}
+.load-panel-card:not(.has-processed-videos) .capture-section {
+  flex: 0 0 auto;
+}
 .subsection-title {
   font-size: 0.95rem;
   font-weight: 600;
@@ -1226,9 +1445,11 @@ function createCombineTask() {
 .row {
   display: flex;
   gap: 0.75rem;
+  min-width: 0;
 }
 .col {
   flex: 1;
+  min-width: 0;
 }
 .no-bottom,
 .row .input-group {
@@ -1267,7 +1488,29 @@ select:focus {
   font-size: 0.78rem;
   margin-top: 0.4rem;
 }
-.input-group.drop-target .input-with-btn {
+.video-path-display {
+  min-width: 0;
+  padding: 0.45rem 0;
+  color: var(--text-color);
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.source-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+  margin-top: 0.6rem;
+  white-space: nowrap;
+}
+.source-actions-row .btn {
+  flex: 0 0 auto;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.78rem;
+}
+.input-group.drop-target .video-path-row {
   border-radius: 8px;
   box-shadow: 0 0 0 2px var(--primary-color);
 }
@@ -1298,13 +1541,6 @@ select:focus {
   color: #cbd5e1;
   font-size: 0.85rem;
   font-weight: 400;
-}
-.preprocess-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.6rem;
-  margin-top: 0.75rem;
 }
 .info-hint-wrap {
   position: relative;
@@ -1339,18 +1575,65 @@ select:focus {
   box-shadow: 0 10px 24px rgba(0, 0, 0, 0.45);
 }
 .processed-list {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 9rem;
   margin-top: 0.9rem;
   border: 1px solid var(--border-color);
   border-radius: 8px;
-  padding: 0.6rem 0.75rem;
+  padding: 0.6rem 0.75rem 0;
+  overflow: hidden;
 }
 .processed-list-header {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
+  gap: 0.5rem;
   font-size: 0.8rem;
   color: var(--text-muted);
   margin-bottom: 0.4rem;
+}
+.processed-list-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+.btn-danger {
+  border: 0;
+  background: #7f1d1d;
+  color: #fecaca;
+}
+.btn-danger:hover:not(:disabled) {
+  background: #991b1b;
+}
+.processed-delete-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0 0 0.75rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: 8px;
+  background: rgba(127, 29, 29, 0.35);
+  color: #fecaca;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+.processed-delete-confirm-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 0.5rem;
+}
+.processed-items {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding-right: 0.5rem;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 .processed-item {
   display: flex;
@@ -1373,10 +1656,14 @@ select:focus {
 }
 .mode-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 1.2rem;
   color: var(--text-muted);
   font-size: 0.9rem;
   margin: 0 0 1rem;
+}
+.mode-row label {
+  min-width: 0;
 }
 .mode-row input {
   margin-right: 0.35rem;
@@ -1476,10 +1763,16 @@ select:focus {
   cursor: pointer;
 }
 .expansion-queue {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
   margin-top: 0.9rem;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 0.6rem 0.75rem;
+  overflow: hidden;
 }
 .expansion-queue-header {
   display: flex;
@@ -1490,8 +1783,18 @@ select:focus {
   margin-bottom: 0.4rem;
 }
 .expansion-queue-list {
-  max-height: 260px;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding-right: 0.5rem;
   overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.load-panel-card:not(.has-processed-videos) .expansion-queue {
+  flex: 0 0 auto;
+}
+.load-panel-card:not(.has-processed-videos) .expansion-queue-list {
+  flex: 0 1 auto;
+  max-height: 260px;
 }
 .expansion-queue-item {
   display: flex;
@@ -1500,6 +1803,7 @@ select:focus {
   padding: 0.4rem 0;
   border-top: 1px solid var(--border-color);
   font-size: 0.82rem;
+  min-width: 0;
 }
 .expansion-queue-item:first-of-type {
   border-top: 0;
@@ -1541,6 +1845,9 @@ select:focus {
 }
 .progress-container {
   margin: 0 0.2rem;
+}
+.load-panel-card.initial-mode .progress-container {
+  margin-top: 0.75rem;
 }
 .progress-bar-bg {
   height: 8px;
@@ -1761,11 +2068,17 @@ select:focus {
   align-items: center;
   justify-content: center;
 }
-.modal-filmstrip-toggle {
+.modal-display-controls {
   position: absolute;
   right: 1rem;
   bottom: 1rem;
   z-index: 202;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+.modal-image-size-toggle,
+.modal-filmstrip-toggle {
   padding: 0.5rem 0.9rem;
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.15);
@@ -1774,6 +2087,7 @@ select:focus {
   font-size: 0.8rem;
   cursor: pointer;
 }
+.modal-image-size-toggle:hover,
 .modal-filmstrip-toggle:hover {
   background: rgba(71, 85, 105, 0.95);
 }
@@ -1784,6 +2098,24 @@ select:focus {
   padding: 1rem;
   background: #020617;
   text-align: center;
+}
+.modal-content-scroller.fit-mode {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-content-scroller.fit-mode .modal-image-viewport {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
 }
 .modal-time-label {
   color: #e5e7eb;
@@ -1796,6 +2128,11 @@ select:focus {
   display: block;
   max-width: none;
   margin: 0 auto;
+}
+.fit-mode .original-size-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
 }
 .modal-close-btn {
   position: fixed;
@@ -1901,9 +2238,24 @@ select:focus {
   letter-spacing: 0.02em;
   z-index: 1;
 }
+@media (min-width: 901px) {
+  .main-layout {
+    height: calc(100vh - 112px);
+  }
+  .load-panel-card.has-processed-videos {
+    height: 0;
+  }
+}
 @media (max-width: 900px) {
   .main-layout {
     grid-template-columns: 1fr;
+  }
+  .settings-panel {
+    min-height: calc(100vh - 112px);
+  }
+  .load-panel-card.has-processed-videos {
+    flex: 1 1 0;
+    min-height: 0;
   }
 }
 @media (max-width: 600px) {

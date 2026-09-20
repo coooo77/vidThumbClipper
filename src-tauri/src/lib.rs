@@ -1,8 +1,42 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+type ThumbnailRuns = Mutex<HashMap<String, Arc<AtomicBool>>>;
+
+#[tauri::command]
+fn begin_thumbnail(request_id: String, runs: tauri::State<ThumbnailRuns>) -> Result<(), String> {
+    let mut runs = runs.lock().map_err(|_| "Thumbnail state lock poisoned")?;
+    if runs.contains_key(&request_id) {
+        return Err("Duplicate thumbnail request".into());
+    }
+    runs.insert(request_id, Arc::new(AtomicBool::new(false)));
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_thumbnail(request_id: String, runs: tauri::State<ThumbnailRuns>) -> Result<(), String> {
+    if let Some(cancel) = runs
+        .lock()
+        .map_err(|_| "Thumbnail state lock poisoned")?
+        .get(&request_id)
+    {
+        cancel.store(true, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn end_thumbnail(request_id: String, runs: tauri::State<ThumbnailRuns>) -> Result<(), String> {
+    runs.lock()
+        .map_err(|_| "Thumbnail state lock poisoned")?
+        .remove(&request_id);
+    Ok(())
+}
 
 use base64::{engine::general_purpose, Engine as _};
 
@@ -42,8 +76,20 @@ fn spawn_hidden(executable: &str) -> Command {
 // turn "wait for exit" into its own indefinite hang. If the timeout elapses, the child is killed
 // so the caller is guaranteed a result either way instead of hanging forever.
 fn run_with_timeout(
-    mut child: std::process::Child,
+    child: std::process::Child,
     timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    run_controlled(
+        child,
+        std::time::Instant::now() + timeout,
+        &AtomicBool::new(false),
+    )
+}
+
+fn run_controlled(
+    mut child: std::process::Child,
+    deadline: std::time::Instant,
+    cancelled: &AtomicBool,
 ) -> Result<std::process::Output, String> {
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
@@ -62,34 +108,49 @@ fn run_with_timeout(
         buffer
     });
 
-    let start = std::time::Instant::now();
-    let status = loop {
+    let outcome = loop {
+        if cancelled.load(Ordering::SeqCst) {
+            break Err("Thumbnail cancelled".to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err("Process timed out: deadline exceeded".to_string());
+        }
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_handle.join();
-                let _ = stderr_handle.join();
-                return Err(format!("Unable to wait for process: {error}"));
+                break Err(format!("Unable to wait for process: {error}"));
             }
-        }
-        if start.elapsed() > timeout {
-            let kill_result = child.kill();
-            let wait_result = child.wait();
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            return Err(format!(
-                "Process timed out after {} seconds and was stopped (kill={kill_result:?}, wait={wait_result:?}).",
-                timeout.as_secs()
-            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(150));
     };
 
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
+    // Reaping and pipe EOF must not keep the caller blocked indefinitely.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let kill = if outcome.is_err() {
+            child.kill()
+        } else {
+            Ok(())
+        };
+        let _ = child.wait();
+        let stdout = stdout_handle.join().unwrap_or_default();
+        let stderr = stderr_handle.join().unwrap_or_default();
+        let result = match outcome {
+            Ok(status) => Ok((status, stdout, stderr)),
+            Err(error) => Err(format!(
+                "{error}; stop result: {kill:?}\n{}{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            )),
+        };
+        let _ = sender.send(result);
+    });
+    let (status, stdout, stderr) = receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .map_err(|_| {
+            "Process cleanup exceeded 2 seconds; background cleanup is still pending".to_string()
+        })??;
     Ok(std::process::Output {
         status,
         stdout,
@@ -98,11 +159,11 @@ fn run_with_timeout(
 }
 
 #[tauri::command]
-fn cancel_current_task(running: tauri::State<RunningPid>) -> Result<(), String> {
+fn cancel_current_task(running: tauri::State<RunningPid>) -> Result<bool, String> {
     let pid = *running
         .lock()
         .map_err(|_| "State lock poisoned".to_string())?;
-    let Some(pid) = pid else { return Ok(()) };
+    let Some(pid) = pid else { return Ok(false) };
     #[cfg(target_os = "windows")]
     {
         let _ = spawn_hidden("taskkill")
@@ -113,7 +174,7 @@ fn cancel_current_task(running: tauri::State<RunningPid>) -> Result<(), String> 
     {
         let _ = spawn_hidden("kill").args(["-9", &pid.to_string()]).output();
     }
-    Ok(())
+    Ok(true)
 }
 
 #[tauri::command]
@@ -150,7 +211,10 @@ fn delete_file(path: String) -> Result<(), String> {
         // A missing output is already in the desired state, so stale task records can still be
         // removed from the processed-video list.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("Unable to delete file '{}': {error}", path.display())),
+        Err(error) => Err(format!(
+            "Unable to delete file '{}': {error}",
+            path.display()
+        )),
     }
 }
 
@@ -237,12 +301,31 @@ async fn get_video_duration(
 
 #[tauri::command]
 async fn capture_single_thumbnail(
+    request_id: String,
+    runs: tauri::State<'_, ThumbnailRuns>,
     ffmpeg_path: Option<String>,
     video_path: String,
     time: String,
     index: i64,
 ) -> Result<String, String> {
+    let cancelled = runs
+        .lock()
+        .map_err(|_| "Thumbnail state lock poisoned")?
+        .get(&request_id)
+        .cloned()
+        .ok_or("Unknown thumbnail request")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     tauri::async_runtime::spawn_blocking(move || {
+        let check = || {
+            if cancelled.load(Ordering::SeqCst) {
+                Err("Thumbnail cancelled".to_string())
+            } else if std::time::Instant::now() >= deadline {
+                Err("Thumbnail timed out after 30 seconds".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
         let executable = ffmpeg_path
             .filter(|path| !path.trim().is_empty())
             .unwrap_or_else(|| "ffmpeg".into());
@@ -284,7 +367,13 @@ async fn capture_single_thumbnail(
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| format!("Unable to run ffmpeg: {error}"))
-            .and_then(|child| run_with_timeout(child, std::time::Duration::from_secs(20)));
+            .and_then(|child| {
+                run_controlled(
+                    child,
+                    deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(20)),
+                    &cancelled,
+                )
+            });
         let fast_ok = matches!(&fast_output, Ok(output) if output.status.success())
             && captured_ok(&fast_path);
         debug.push(thumbnail_attempt_debug(
@@ -300,6 +389,10 @@ async fn capture_single_thumbnail(
         } else {
             // Do not leave a zero-byte/invalid fast output around while the fallback runs.
             let _ = std::fs::remove_file(&fast_path);
+            check().map_err(|error| format!("{error}\n{}", debug.join("\n")))?;
+            if matches!(&fast_output, Err(error) if error.contains("cleanup exceeded") || error.contains("stop result: Err")) {
+                return Err(format!("Thumbnail process could not be cleaned up; retry stopped.\n{}", debug.join("\n")));
+            }
             let precise_path = cache_dir.join(format!("thumbnail_{index}_{timestamp}_precise.jpg"));
             let precise_path_string = precise_path.to_string_lossy().to_string();
             let precise_args = [
@@ -318,8 +411,7 @@ async fn capture_single_thumbnail(
                 "unofficial",
                 &precise_path_string,
             ];
-            // Precise seek is slower, but the timeout guarantees a failed capture eventually returns
-            // to Home instead of leaving the initial/expansion state stuck forever.
+            // Both attempts share the same 30-second deadline; fallback gets only what remains.
             let precise_started = std::time::Instant::now();
             let precise_output = spawn_hidden(&executable)
                 .args(precise_args)
@@ -327,7 +419,7 @@ async fn capture_single_thumbnail(
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|error| format!("Unable to run ffmpeg: {error}"))
-                .and_then(|child| run_with_timeout(child, std::time::Duration::from_secs(120)));
+                .and_then(|child| run_controlled(child, deadline, &cancelled));
             let precise_ok = matches!(&precise_output, Ok(output) if output.status.success())
                 && captured_ok(&precise_path);
             debug.push(thumbnail_attempt_debug(
@@ -490,12 +582,16 @@ async fn concat_videos(
 pub fn run() {
     tauri::Builder::default()
         .manage(Arc::new(Mutex::new(None::<u32>)) as RunningPid)
+        .manage(ThumbnailRuns::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             run_ffmpeg,
             get_video_duration,
             capture_single_thumbnail,
+            begin_thumbnail,
+            cancel_thumbnail,
+            end_thumbnail,
             get_thumbnail_cache_dir,
             clear_thumbnail_cache,
             delete_file,
@@ -505,4 +601,90 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    // Launch this test binary as a controlled child, without depending on installed FFmpeg.
+    fn fixture(mode: &str) -> std::process::Child {
+        spawn_hidden(std::env::current_exe().unwrap().to_str().unwrap())
+            .args([
+                "--exact",
+                "tests::process_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("THUMBNAIL_TEST_MODE", mode)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture only"]
+    fn process_fixture() {
+        if std::env::var("THUMBNAIL_TEST_MODE").unwrap() == "output" {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(&vec![b'x'; 256 * 1024])
+                .unwrap();
+            std::io::stderr()
+                .write_all(&vec![b'y'; 256 * 1024])
+                .unwrap();
+        } else {
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_running_child() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let child = fixture("sleep");
+        let started = Instant::now();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            signal.store(true, Ordering::SeqCst);
+        });
+        let error = run_controlled(child, started + Duration::from_secs(8), &cancel).unwrap_err();
+        setter.join().unwrap();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(error.contains("stop result: Ok"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn retry_uses_remaining_deadline() {
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(700);
+        let fast = run_controlled(
+            fixture("sleep"),
+            started + Duration::from_millis(300),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(fast.contains("timed out"), "{fast}");
+        let precise = run_controlled(fixture("sleep"), deadline, &cancel).unwrap_err();
+        assert!(precise.contains("timed out"), "{precise}");
+        assert!(precise.contains("stop result: Ok"), "{precise}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn drains_both_pipes_without_deadlock() {
+        let output = run_controlled(
+            fixture("output"),
+            Instant::now() + Duration::from_secs(5),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.len() >= 256 * 1024);
+        assert!(output.stderr.len() >= 256 * 1024);
+    }
 }

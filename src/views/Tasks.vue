@@ -46,18 +46,36 @@ async function chooseOutputDirectory() {
   }
 }
 function requestStopCurrentTask() {
+  const current = videoTasks.find((task) => task.status === '處理中')
+  if (current) requestStopTask(current)
+}
+function requestStopTask(task: VideoTask) {
+  if (task.status !== '處理中') return
+  pendingCancelTaskId.value = task.id
   showStopConfirm.value = true
 }
 function cancelStopConfirm() {
   showStopConfirm.value = false
+  pendingCancelTaskId.value = null
 }
 async function confirmStopCurrentTask() {
   showStopConfirm.value = false
-  const current = videoTasks.find((task) => task.status === '處理中')
-  if (!current) return
-  pendingCancelTaskId.value = current.id
+  const taskId = pendingCancelTaskId.value
+  const current = videoTasks.find((task) => task.id === taskId && task.status === '處理中')
+  if (!current) {
+    pendingCancelTaskId.value = null
+    return
+  }
   try {
-    await invoke('cancel_current_task')
+    const processWasRunning = await invoke<boolean>('cancel_current_task')
+    if (!processWasRunning) {
+      // After restarting the app, the persisted task may still say "處理中" even
+      // though this app instance no longer owns the ffmpeg process.
+      current.status = '已取消'
+      current.message = '此任務已停止；若輸出資料夾中留下不完整檔案，請手動刪除。'
+      pendingCancelTaskId.value = null
+      if (!running.value) void runTasks()
+    }
   } catch {
     // The running task's own catch block in runTasks() handles the status update either way.
   }
@@ -232,11 +250,17 @@ async function runTasks() {
     <section class="card">
       <p v-if="!videoTasks.length" class="info">尚無等待任務。請回到「影片擷取與剪輯」從 Grid 建立任務。</p>
       <div v-for="(task, index) in videoTasks" :key="task.id" class="task-row">
-        <div>
-          <strong
-            >{{ index + 1 }}.
-            {{ task.kind === 'clip' ? '剪輯' : task.kind === 'merge' ? '剪輯＋合併' : task.kind === 'combine' ? '合併影片' : '預先處理' }}</strong
-          ><span class="status" :class="task.status">{{ task.status }}</span>
+        <div class="task-content w-full">
+          <div class="task-header">
+            <div class="task-heading">
+              <strong class="task-title truncate"
+                >{{ index + 1 }}.
+                {{ task.kind === 'clip' ? '剪輯' : task.kind === 'merge' ? '剪輯＋合併' : task.kind === 'combine' ? '合併影片' : '預先處理' }}</strong
+              ><span class="status" :class="task.status">{{ task.status }}</span>
+            </div>
+            <button v-if="task.kind === 'preprocess' && task.status === '處理中'" class="btn btn-danger compact task-stop" @click="requestStopTask(task)">停止</button>
+            <button v-else-if="task.status !== '處理中'" class="remove" @click="videoTasks.splice(index, 1)">移除</button>
+          </div>
           <p>
             {{
               task.kind === 'preprocess'
@@ -252,16 +276,15 @@ async function runTasks() {
                         : `${formatTime(task.segments[0]?.start || 0)} → ${formatTime(task.segments[0]?.end || 0)}`
             }}
           </p>
-          <p>{{ task.outputName }}.{{ task.extension }}</p>
+          <p class="task-file-name truncate w-full" :title="`${task.outputName}.${task.extension}`">{{ task.outputName }}.{{ task.extension }}</p>
           <div class="task-output-dir">
             <label>輸出位置</label>
-            <input v-model="task.outputDir" :disabled="task.status !== '等待中'" :placeholder="`預設：${outputDirectory || '原始影片所在資料夾'}`" />
+            <input class="w-full" v-model="task.outputDir" :disabled="task.status !== '等待中'" :placeholder="`預設：${outputDirectory || '原始影片所在資料夾'}`" />
             <button v-if="task.status === '等待中'" class="btn btn-secondary compact" @click="chooseTaskOutputDirectory(task)">選擇</button>
             <button v-if="task.status === '等待中' && task.outputDir" class="btn-clear" @click="clearTaskOutputDirectory(task)">清除</button>
           </div>
           <p v-if="task.message" class="message">{{ task.message }}</p>
         </div>
-        <button v-if="task.status !== '處理中'" class="remove" @click="videoTasks.splice(index, 1)">移除</button>
       </div>
     </section>
   </div>
@@ -289,13 +312,37 @@ async function runTasks() {
 }
 .task-row {
   display: flex;
-  justify-content: space-between;
   gap: 1rem;
   padding: 1rem;
   margin: 0.6rem 0;
   border: 1px solid var(--border-color);
   border-radius: 10px;
   background: rgba(15, 23, 42, 0.45);
+}
+.task-content {
+  min-width: 0;
+}
+.task-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  min-width: 0;
+}
+.task-heading {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.task-title {
+  min-width: 0;
+}
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .task-row p {
   color: var(--text-muted);
@@ -310,6 +357,7 @@ async function runTasks() {
   background: #334155;
   color: #e2e8f0;
   font-size: 0.76rem;
+  flex-shrink: 0;
 }
 .完成 {
   background: rgba(16, 185, 129, 0.2);
@@ -337,6 +385,7 @@ async function runTasks() {
   background: none;
   color: #fca5a5;
   cursor: pointer;
+  flex-shrink: 0;
 }
 .btn-danger {
   background: #7f1d1d;
@@ -375,6 +424,8 @@ async function runTasks() {
   align-items: center;
   gap: 0.5rem;
   margin-top: 0.5rem;
+  width: 100%;
+  min-width: 0;
 }
 .task-output-dir label {
   color: var(--text-muted);
@@ -382,11 +433,14 @@ async function runTasks() {
   white-space: nowrap;
 }
 .task-output-dir input {
-  flex: 1;
+  flex: 1 1 0;
+  width: 100%;
+  min-width: 0;
   padding: 0.4rem 0.6rem;
   font-size: 0.82rem;
 }
 .task-output-dir .compact {
+  flex-shrink: 0;
   padding: 0.4rem 0.7rem;
   font-size: 0.78rem;
 }

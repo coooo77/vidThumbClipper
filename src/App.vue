@@ -6,6 +6,13 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 const route = useRoute()
 const isAlwaysOnTop = ref(false)
 
+function handleHomeNavigation() {
+  // A router-link to the current route does not trigger a route update. Notify the
+  // Home view explicitly so clicking the current navigation item still resets its
+  // visible panel.
+  window.dispatchEvent(new Event('home-navigation'))
+}
+
 async function toggleAlwaysOnTop() {
   const next = !isAlwaysOnTop.value
   try {
@@ -27,7 +34,7 @@ async function toggleAlwaysOnTop() {
         </div>
         <div class="header-actions">
           <nav class="nav-links">
-            <router-link to="/" class="nav-item" active-class="nav-active"> 影片擷取與剪輯 </router-link>
+            <router-link to="/" class="nav-item" active-class="nav-active" @click="handleHomeNavigation"> 影片擷取與剪輯 </router-link>
             <router-link to="/tasks" class="nav-item" active-class="nav-active">處理影片任務</router-link>
             <router-link to="/settings" class="nav-item" active-class="nav-active"> 設定 </router-link>
           </nav>

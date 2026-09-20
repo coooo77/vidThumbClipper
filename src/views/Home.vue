@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -36,6 +36,7 @@ const ffprobePath = ref('')
 const videoPath = ref('')
 const originalSourcePath = ref('')
 const isProcessing = ref(false)
+const initialCaptureCancelRequested = ref(false)
 const isEndpointProcessing = ref(false)
 const isExpanding = ref(false)
 const isDraggingFile = ref(false)
@@ -159,10 +160,46 @@ const activeModalItem = computed(() => (activeModalIndex.value !== null ? (modal
 // Auto-scroll the filmstrip so the active item is in view — covers opening the modal, prev/next
 // navigation, and clicking a different filmstrip thumbnail, since all of those just change this index.
 const filmstripItemRefs = ref<HTMLElement[]>([])
+const filmstripRef = ref<HTMLElement | null>(null)
+let filmstripScrollFrame: number | null = null
+
+function cancelFilmstripScrollAnimation() {
+  if (filmstripScrollFrame !== null) {
+    cancelAnimationFrame(filmstripScrollFrame)
+    filmstripScrollFrame = null
+  }
+}
+
+function scrollFilmstripToItem(index: number) {
+  const container = filmstripRef.value
+  const item = filmstripItemRefs.value[index]
+  if (!container || !item) return
+
+  cancelFilmstripScrollAnimation()
+  const maxScrollLeft = Math.max(0, container.scrollWidth - container.clientWidth)
+  const targetLeft = Math.max(0, Math.min(item.offsetLeft - (container.clientWidth - item.offsetWidth) / 2, maxScrollLeft))
+  const startLeft = container.scrollLeft
+  const distance = targetLeft - startLeft
+  if (Math.abs(distance) < 1) return
+
+  // scrollIntoView({ behavior: 'smooth' }) does not expose a duration and can take too long when
+  // the filmstrip contains many thumbnails. Use an explicit animation capped at two seconds.
+  const duration = Math.min(2000, Math.max(200, Math.abs(distance) * 1.5))
+  const startedAt = performance.now()
+  const animate = (now: number) => {
+    const progress = Math.min(1, (now - startedAt) / duration)
+    const easedProgress = 1 - Math.pow(1 - progress, 3)
+    container.scrollLeft = startLeft + distance * easedProgress
+    if (progress < 1) filmstripScrollFrame = requestAnimationFrame(animate)
+    else filmstripScrollFrame = null
+  }
+  filmstripScrollFrame = requestAnimationFrame(animate)
+}
+
 watch(activeModalIndex, async (index) => {
   if (index === null) return
   await nextTick()
-  filmstripItemRefs.value[index]?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' })
+  scrollFilmstripToItem(index)
 })
 
 const newCaptureCount = computed(() => {
@@ -200,6 +237,11 @@ function dirName(path: string) {
 let unlistenDragDrop: (() => void) | null = null
 const infoHintWrap = ref<HTMLElement | null>(null)
 
+function selectVideoFilePanel() {
+  activePanel.value = 'load'
+  loadSubPanel.value = 'source'
+}
+
 function handleDocumentClick(event: MouseEvent) {
   if (showPreprocessHint.value && infoHintWrap.value && !infoHintWrap.value.contains(event.target as Node)) {
     showPreprocessHint.value = false
@@ -208,6 +250,7 @@ function handleDocumentClick(event: MouseEvent) {
 
 onMounted(async () => {
   loadPaths()
+  window.addEventListener('home-navigation', selectVideoFilePanel)
   document.addEventListener('click', handleDocumentClick)
   try {
     unlistenDragDrop = await getCurrentWebview().onDragDropEvent((event) => {
@@ -227,10 +270,16 @@ onMounted(async () => {
   }
 })
 
+// Home is kept alive between routes, so restore the default load/source view whenever
+// the user returns to this page from another navigation item.
+onActivated(selectVideoFilePanel)
+
 onUnmounted(() => {
   unlistenDragDrop?.()
+  window.removeEventListener('home-navigation', selectVideoFilePanel)
   document.removeEventListener('click', handleDocumentClick)
   if (autoClearFinishedTimer) clearTimeout(autoClearFinishedTimer)
+  cancelFilmstripScrollAnimation()
 })
 
 defineExpose({ loadPaths })
@@ -524,7 +573,29 @@ async function deleteAllProcessedVideos() {
   }
 }
 
-async function captureAtTimes(times: number[], offset: number, shouldStop?: () => boolean) {
+let activeThumbnailRequest: string | null = null
+
+async function captureThumbnail(args: Record<string, unknown>, shouldStop?: () => boolean) {
+  const requestId = newTaskId()
+  await invoke('begin_thumbnail', { requestId })
+  try {
+    if (shouldStop?.()) throw new Error('Thumbnail cancelled')
+    if (shouldStop) activeThumbnailRequest = requestId
+    return await invoke<string>('capture_single_thumbnail', { ...args, requestId })
+  } finally {
+    if (activeThumbnailRequest === requestId) activeThumbnailRequest = null
+    await invoke('end_thumbnail', { requestId })
+  }
+}
+
+function stopActiveThumbnail() {
+  if (activeThumbnailRequest) {
+    void invoke('cancel_thumbnail', { requestId: activeThumbnailRequest })
+      .catch((error) => addLog(`無法傳送取消要求：${String(error)}`))
+  }
+}
+
+async function captureAtTimes(times: number[], offset: number, shouldStop?: () => boolean, onCaptured?: (item: ThumbnailItem) => void) {
   const result: ThumbnailItem[] = []
   for (let i = 0; i < times.length; i += 1) {
     if (shouldStop && shouldStop()) break
@@ -533,13 +604,26 @@ async function captureAtTimes(times: number[], offset: number, shouldStop?: () =
     // safe to start an expansion even though isProcessing was still true.
     progressPercent.value = Math.round((i / times.length) * 100)
     progressText.value = `正在擷取 ${i + 1}/${times.length} 張（${progressPercent.value}%）`
-    const base64 = await invoke<string>('capture_single_thumbnail', {
-      ffmpegPath: ffmpegPath.value || null,
-      videoPath: videoPath.value,
-      time: times[i].toFixed(3),
-      index: offset + i,
-    })
-    result.push({ time: times[i], timeStr: formatSeconds(times[i]), base64: `data:image/jpeg;base64,${base64}` })
+    let base64: string
+    try {
+      base64 = await captureThumbnail({
+        ffmpegPath: ffmpegPath.value || null,
+        videoPath: videoPath.value,
+        time: times[i].toFixed(3),
+        index: offset + i,
+      }, shouldStop)
+    } catch (error) {
+      if (shouldStop?.()) {
+        if (String(error).includes('cleanup') || String(error).includes('stop result: Err')) {
+          addLog(`取消後程序清理異常：${String(error)}`)
+        }
+        break
+      }
+      throw error
+    }
+    const item = { time: times[i], timeStr: formatSeconds(times[i]), base64: `data:image/jpeg;base64,${base64}` }
+    result.push(item)
+    onCaptured?.(item)
     progressPercent.value = Math.round(((i + 1) / times.length) * 100)
     progressText.value = `已完成擷取 ${i + 1}/${times.length} 張（${progressPercent.value}%）`
   }
@@ -554,6 +638,7 @@ async function generateGridThumbnails() {
   const count = initialThumbnailCount.value
   loadPaths()
   isProcessing.value = true
+  initialCaptureCancelRequested.value = false
   thumbnails.value = []
   startThumbnail.value = null
   endThumbnail.value = null
@@ -564,14 +649,21 @@ async function generateGridThumbnails() {
     duration = await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: videoPath.value })
     videoDuration.value = duration
     const times = Array.from({ length: count }, (_, index) => ((index + 1) * duration) / (count + 1))
-    thumbnails.value = await captureAtTimes(times, 0)
+    await captureAtTimes(times, 0, () => initialCaptureCancelRequested.value, (item) => {
+      thumbnails.value.push(item)
+    })
     normaliseLayout()
-    initialCaptureSucceeded = true
-    addLog(`已建立 ${thumbnails.value.length} 張中間縮圖，起點與終點將在背景擷取。`)
+    if (initialCaptureCancelRequested.value) {
+      addLog(`已取消建立初始縮圖，已保留取消前完成的 ${thumbnails.value.length} 張縮圖。`)
+    } else {
+      initialCaptureSucceeded = true
+      addLog(`已建立 ${thumbnails.value.length} 張中間縮圖，起點與終點將在背景擷取。`)
+    }
   } catch (error) {
     addLog(`擷取失敗：${String(error)}`)
   } finally {
     isProcessing.value = false
+    initialCaptureCancelRequested.value = false
     progressText.value = ''
     progressPercent.value = 0
     // If an older UI state queued an expansion while the initial capture was still running,
@@ -581,18 +673,26 @@ async function generateGridThumbnails() {
   }
 }
 
+function cancelInitialThumbnailCapture() {
+  if (!isProcessing.value || initialCaptureCancelRequested.value) return
+  initialCaptureCancelRequested.value = true
+  progressText.value = '正在取消建立縮圖…'
+  stopActiveThumbnail()
+  addLog('已要求中止目前截圖，已完成的縮圖會保留。')
+}
+
 async function captureEndpointThumbnails(duration: number) {
   isEndpointProcessing.value = true
   addLog('開始背景擷取起點與終點縮圖；這不會阻塞擴充佇列。')
   try {
     const endpointResults = await Promise.allSettled([
-      invoke<string>('capture_single_thumbnail', {
+      captureThumbnail({
         ffmpegPath: ffmpegPath.value || null,
         videoPath: videoPath.value,
         time: '0.000',
         index: -1,
       }),
-      invoke<string>('capture_single_thumbnail', {
+      captureThumbnail({
         ffmpegPath: ffmpegPath.value || null,
         videoPath: videoPath.value,
         // Stay a little farther inside the file than the container's reported end. Some long MP4s
@@ -697,11 +797,14 @@ function removeExpansionJob(id: string) {
   if (index !== -1) expansionQueue.value.splice(index, 1)
 }
 
-// Signals the in-flight capture loop to stop after its current step — whatever thumbnails were
-// already captured are still inserted (see runExpansionJob), nothing already done is thrown away.
+// Stop the current backend capture as well as subsequent frames; completed frames stay visible.
 function cancelExpansionJob(id: string) {
   const job = expansionQueue.value.find((item) => item.id === id && item.status === '處理中')
-  if (job) job.cancelRequested = true
+  if (job) {
+    job.cancelRequested = true
+    progressText.value = '正在取消截圖…'
+    stopActiveThumbnail()
+  }
 }
 
 function clearFinishedExpansionJobs() {
@@ -737,9 +840,10 @@ async function runExpansionJob(job: ExpansionJob) {
     addLog(`擴充失敗（${job.label}）：${message}`)
     throw new Error(message)
   }
-  const insertAt = indexForTime(job.anchorEndTime)
-  const additions = await captureAtTimes(times, thumbnails.value.length, () => job.cancelRequested)
-  thumbnails.value.splice(insertAt, 0, ...additions)
+  const additions = await captureAtTimes(times, thumbnails.value.length, () => job.cancelRequested, (item) => {
+    thumbnails.value.splice(indexForTime(job.anchorEndTime), 0, item)
+    normaliseLayout()
+  })
   normaliseLayout()
   if (job.cancelRequested) {
     addLog(`已取消「${job.label}」，已插入取消前完成的 ${additions.length} 張縮圖。`)
@@ -991,8 +1095,16 @@ function createCombineTask() {
             <div class="col input-group"><label>列（M）</label><input v-model.number="gridRows" type="number" min="1" @change="updateLayoutFromUser" /></div>
           </div>
           <p class="info-text">初始擷取 {{ initialThumbnailCount }} 張中間縮圖，連同起點與終點共 {{ initialGridSlotCount }} 格；之後可隨時自行改為任意 N × M 排列。</p>
-          <button class="btn btn-primary btn-glow w-full" :disabled="isProcessing || isEndpointProcessing || isExpanding" @click="generateGridThumbnails">
-            {{ isProcessing ? '處理中…' : '建立縮圖' }}
+          <button
+            v-if="isProcessing"
+            class="btn btn-danger w-full"
+            :disabled="initialCaptureCancelRequested"
+            @click="cancelInitialThumbnailCapture"
+          >
+            {{ initialCaptureCancelRequested ? '取消中…' : '取消建立縮圖' }}
+          </button>
+          <button v-else class="btn btn-primary btn-glow w-full" :disabled="isEndpointProcessing || isExpanding" @click="generateGridThumbnails">
+            建立縮圖
           </button>
         </div>
 
@@ -1007,8 +1119,12 @@ function createCombineTask() {
             <label>秒數（至少 1 秒）</label><input v-model.number="expansionInterval" type="number" min="1" />
             <div class="quick-set-row">
               <button type="button" class="quick-set-btn" :class="{ active: expansionInterval === 1 }" @click="expansionInterval = 1">1 秒</button>
+              <button type="button" class="quick-set-btn" :class="{ active: expansionInterval === 3 }" @click="expansionInterval = 3">3 秒</button>
+              <button type="button" class="quick-set-btn" :class="{ active: expansionInterval === 5 }" @click="expansionInterval = 5">5 秒</button>
               <button type="button" class="quick-set-btn" :class="{ active: expansionInterval === 10 }" @click="expansionInterval = 10">10 秒</button>
+              <button type="button" class="quick-set-btn" :class="{ active: expansionInterval === 30 }" @click="expansionInterval = 30">30 秒</button>
               <button type="button" class="quick-set-btn" :class="{ active: expansionInterval === 60 }" @click="expansionInterval = 60">60 秒</button>
+              <button type="button" class="quick-set-btn" :class="{ active: expansionInterval === 120 }" @click="expansionInterval = 120">120 秒</button>
               <button type="button" class="quick-set-btn" :class="{ active: expansionInterval === 300 }" @click="expansionInterval = 300">300 秒</button>
             </div>
           </div>
@@ -1047,9 +1163,9 @@ function createCombineTask() {
             <div class="expansion-queue-list">
               <div v-for="job in expansionQueue" :key="job.id" class="expansion-queue-item">
                 <span class="job-label">{{ job.label }}</span>
-                <span class="job-status" :class="job.status">{{ job.status }}</span>
+                <span class="job-status" :class="job.status">{{ job.status === '處理中' && job.cancelRequested ? '正在取消…' : job.status }}</span>
                 <button v-if="job.status === '等待中'" class="btn-clear" @click="removeExpansionJob(job.id)">移除</button>
-                <button v-else-if="job.status === '處理中'" class="btn-clear" @click="cancelExpansionJob(job.id)">取消</button>
+                <button v-else-if="job.status === '處理中'" class="btn-clear" :disabled="job.cancelRequested" @click="cancelExpansionJob(job.id)">取消</button>
               </div>
             </div>
           </div>
@@ -1256,7 +1372,7 @@ function createCombineTask() {
           <button class="modal-filmstrip-toggle" @click.stop="filmstripVisible = !filmstripVisible">{{ filmstripVisible ? '隱藏縮圖列 ▾' : '顯示縮圖列 ▸' }}</button>
         </div>
       </div>
-      <div v-if="filmstripVisible" class="modal-filmstrip">
+      <div v-if="filmstripVisible" ref="filmstripRef" class="modal-filmstrip">
         <div
           v-for="(item, index) in modalSequence"
           :key="index"
@@ -1669,12 +1785,14 @@ select:focus {
   margin-right: 0.35rem;
 }
 .quick-set-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(4rem, 1fr));
   gap: 0.4rem;
   margin-top: 0.5rem;
+  min-width: 0;
 }
 .quick-set-btn {
-  flex: 1;
+  min-width: 0;
   border: 1px solid var(--border-color);
   background: rgba(15, 23, 42, 0.5);
   color: var(--text-muted);

@@ -2,7 +2,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
-import { videoTasks, type VideoSegment, type VideoTask } from '../taskStore'
+import { useRouter } from 'vue-router'
+import { queueTaskEdit, videoTasks, type VideoSegment, type VideoTask } from '../taskStore'
 import { getNotifySettings, notifyResult } from '../notify'
 
 const ffmpegPath = ref('')
@@ -11,7 +12,10 @@ const outputDirectory = ref(localStorage.getItem('vid_output_directory') || '')
 const running = ref(false)
 const showStopConfirm = ref(false)
 const pendingCancelTaskId = ref<string | null>(null)
+const pendingEditTaskId = ref<string | null>(null)
+const expandedTaskIds = ref<string[]>([])
 const hasPendingTasks = computed(() => videoTasks.some((task) => task.status === '等待中'))
+const router = useRouter()
 
 onMounted(() => {
   ffmpegPath.value = localStorage.getItem('vid_ffmpeg_path') || ''
@@ -34,8 +38,66 @@ function parseExtraArgs(value: string) {
   return value.trim() ? value.trim().split(/\s+/) : []
 }
 function formatTime(seconds: number) {
-  const total = Math.floor(seconds)
-  return [Math.floor(total / 3600), Math.floor((total % 3600) / 60), total % 60].map((value) => String(value).padStart(2, '0')).join(':')
+  const totalMs = Math.max(0, Math.round(seconds * 1000))
+  const totalSeconds = Math.floor(totalMs / 1000)
+  const base = [Math.floor(totalSeconds / 3600), Math.floor((totalSeconds % 3600) / 60), totalSeconds % 60]
+    .map((value) => String(value).padStart(2, '0'))
+    .join(':')
+  const milliseconds = totalMs % 1000
+  return milliseconds ? `${base}.${String(milliseconds).padStart(3, '0')}` : base
+}
+
+function taskSummary(task: VideoTask) {
+  if (task.kind === 'preprocess') return '整支影片 remux 為 mp4'
+  if (task.kind === 'combine') return `${task.combineSources.length} 支影片・${task.combineMode === 'copy' ? '快速合併' : '相容合併'}`
+  if (task.kind === 'merge') return `${task.segments.length} 個片段`
+  if (task.method === 'duration') return `每 ${task.durationHours} 小時分割`
+  if (task.method === 'count') return `平均分割 ${task.splitCount} 段`
+  return `${formatTime(task.segments[0]?.start || 0)} → ${formatTime(task.segments[0]?.end || 0)}`
+}
+
+function taskRanges(task: VideoTask): VideoSegment[] {
+  if (task.segments.length) return task.segments
+  const duration = task.previewTimeline?.duration || 0
+  if (!duration || task.kind !== 'clip') return []
+  if (task.method === 'duration') {
+    const segmentDuration = task.durationHours * 3600
+    if (segmentDuration <= 0) return []
+    return Array.from({ length: Math.ceil(duration / segmentDuration) }, (_, index) => ({
+      start: index * segmentDuration,
+      end: Math.min(duration, (index + 1) * segmentDuration),
+    }))
+  }
+  if (task.method === 'count') {
+    const count = Math.max(1, Math.floor(task.splitCount))
+    return Array.from({ length: count }, (_, index) => ({
+      start: (duration * index) / count,
+      end: (duration * (index + 1)) / count,
+    }))
+  }
+  return []
+}
+
+function toggleTaskRanges(taskId: string) {
+  expandedTaskIds.value = expandedTaskIds.value.includes(taskId)
+    ? expandedTaskIds.value.filter((id) => id !== taskId)
+    : [...expandedTaskIds.value, taskId]
+}
+
+function requestEditTask(task: VideoTask) {
+  if (task.status === '處理中' || (task.kind !== 'clip' && task.kind !== 'merge')) return
+  pendingEditTaskId.value = task.id
+}
+
+function cancelEditTask() {
+  pendingEditTaskId.value = null
+}
+
+function confirmEditTask(task: VideoTask) {
+  if (pendingEditTaskId.value !== task.id || task.status === '處理中' || (task.kind !== 'clip' && task.kind !== 'merge')) return
+  pendingEditTaskId.value = null
+  queueTaskEdit(task.id)
+  router.push('/')
 }
 
 async function chooseOutputDirectory() {
@@ -122,11 +184,15 @@ async function runPreprocessTask(task: VideoTask) {
   task.resultPath = path
 }
 async function runClipTask(task: VideoTask) {
-  const duration = task.method === 'range' ? 0 : await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: task.source })
+  const duration = task.method === 'range' || task.segments.length
+    ? 0
+    : await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: task.source })
   const ranges: VideoSegment[] =
-    task.method === 'range'
+    task.segments.length
       ? task.segments
-      : task.method === 'duration'
+      : task.method === 'range'
+        ? task.segments
+        : task.method === 'duration'
         ? Array.from({ length: Math.ceil(duration / (task.durationHours * 3600)) }, (_, index) => ({
             start: index * task.durationHours * 3600,
             end: Math.min(duration, (index + 1) * task.durationHours * 3600),
@@ -256,26 +322,48 @@ async function runTasks() {
               <strong class="task-title truncate"
                 >{{ index + 1 }}.
                 {{ task.kind === 'clip' ? '剪輯' : task.kind === 'merge' ? '剪輯＋合併' : task.kind === 'combine' ? '合併影片' : '預先處理' }}</strong
-              ><span class="status" :class="task.status">{{ task.status }}</span>
+              ><span class="status" :class="task.status">{{ task.status }}</span><span class="task-summary">{{ taskSummary(task) }}</span>
             </div>
-            <button v-if="task.kind === 'preprocess' && task.status === '處理中'" class="btn btn-danger compact task-stop" @click="requestStopTask(task)">停止</button>
-            <button v-else-if="task.status !== '處理中'" class="remove" @click="videoTasks.splice(index, 1)">移除</button>
+            <div class="task-row-actions">
+              <button
+                v-if="task.kind === 'clip' || task.kind === 'merge'"
+                class="task-control task-control-range"
+                :aria-expanded="expandedTaskIds.includes(task.id)"
+                @click="toggleTaskRanges(task.id)"
+              >
+                {{ expandedTaskIds.includes(task.id) ? '收合範圍' : '查看範圍' }}
+              </button>
+              <button
+                v-if="(task.kind === 'clip' || task.kind === 'merge') && task.status !== '處理中'"
+                class="task-control task-control-edit"
+                @click="requestEditTask(task)"
+              >再編輯</button>
+              <button v-if="task.kind === 'preprocess' && task.status === '處理中'" class="btn btn-danger compact task-stop" @click="requestStopTask(task)">停止</button>
+              <button v-else-if="task.status !== '處理中'" class="task-control task-control-remove" @click="videoTasks.splice(index, 1)">移除</button>
+            </div>
           </div>
-          <p>
-            {{
-              task.kind === 'preprocess'
-                ? '整支影片 remux 為 mp4'
-                : task.kind === 'combine'
-                  ? `${task.combineSources.length} 支影片（${task.combineMode === 'copy' ? '快速' : '相容'}合併）`
-                  : task.kind === 'merge'
-                    ? `${task.segments.length} 個片段`
-                    : task.method === 'duration'
-                      ? `每 ${task.durationHours} 小時分割`
-                      : task.method === 'count'
-                        ? `平均分割 ${task.splitCount} 段`
-                        : `${formatTime(task.segments[0]?.start || 0)} → ${formatTime(task.segments[0]?.end || 0)}`
-            }}
-          </p>
+          <div v-if="pendingEditTaskId === task.id" class="edit-confirm">
+            <span>
+              {{ task.status === '等待中' ? '確定要再編輯這筆任務嗎？儲存後會直接更新原任務。' : '確定要再編輯這筆任務嗎？原任務會保留，儲存後將另建新的等待任務。' }}
+            </span>
+            <div class="edit-confirm-actions">
+              <button class="task-control task-control-range" @click="cancelEditTask">取消</button>
+              <button class="task-control task-control-edit" @click="confirmEditTask(task)">確定再編輯</button>
+            </div>
+          </div>
+          <div v-if="expandedTaskIds.includes(task.id) && (task.kind === 'clip' || task.kind === 'merge')" class="range-details">
+            <div class="range-details-header">
+              <strong>剪輯範圍</strong>
+              <span v-if="task.previewTimeline">保存 {{ task.previewTimeline.times.length }} 個縮圖時間點（不含圖片）</span>
+            </div>
+            <div v-if="taskRanges(task).length" class="range-list">
+              <div v-for="(range, rangeIndex) in taskRanges(task)" :key="`${range.start}-${range.end}-${rangeIndex}`" class="range-item">
+                <span>片段 {{ rangeIndex + 1 }}</span>
+                <code>{{ formatTime(range.start) }} → {{ formatTime(range.end) }}</code>
+              </div>
+            </div>
+            <p v-else class="range-empty">這筆舊任務沒有保存可展開的實際範圍，執行時會依影片長度計算。</p>
+          </div>
           <p class="task-file-name truncate w-full" :title="`${task.outputName}.${task.extension}`">{{ task.outputName }}.{{ task.extension }}</p>
           <div class="task-output-dir">
             <label>輸出位置</label>
@@ -283,7 +371,11 @@ async function runTasks() {
             <button v-if="task.status === '等待中'" class="btn btn-secondary compact" @click="chooseTaskOutputDirectory(task)">選擇</button>
             <button v-if="task.status === '等待中' && task.outputDir" class="btn-clear" @click="clearTaskOutputDirectory(task)">清除</button>
           </div>
-          <p v-if="task.message" class="message">{{ task.message }}</p>
+          <p
+            v-if="task.message"
+            class="message"
+            :class="{ 'message-success': task.status === '完成', 'message-error': task.status === '失敗', 'message-cancelled': task.status === '已取消' }"
+          >{{ task.message }}</p>
         </div>
       </div>
     </section>
@@ -324,20 +416,116 @@ async function runTasks() {
 }
 .task-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
   width: 100%;
   min-width: 0;
+  margin-bottom: 0.7rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
 }
 .task-heading {
   display: flex;
   align-items: center;
+  gap: 0.55rem;
+  overflow: hidden;
   min-width: 0;
   flex: 1 1 auto;
 }
 .task-title {
   min-width: 0;
+  flex-shrink: 0;
+}
+.task-summary {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-summary::before {
+  content: '·';
+  margin-right: 0.55rem;
+  color: rgba(148, 163, 184, 0.55);
+}
+.task-row-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.45rem;
+  flex-shrink: 0;
+}
+.task-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0.42rem 0.72rem;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  font-family: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.18s ease, background-color 0.18s ease, color 0.18s ease;
+}
+.task-control-range {
+  border-color: rgba(129, 140, 248, 0.22);
+  background: rgba(99, 102, 241, 0.06);
+  color: #c7d2fe;
+}
+.task-control-range:hover {
+  border-color: rgba(129, 140, 248, 0.42);
+  background: rgba(99, 102, 241, 0.13);
+  color: #eef2ff;
+}
+.task-control-edit {
+  border-color: rgba(129, 140, 248, 0.42);
+  background: rgba(99, 102, 241, 0.24);
+  color: #eef2ff;
+}
+.task-control-edit:hover {
+  border-color: rgba(165, 180, 252, 0.58);
+  background: rgba(99, 102, 241, 0.38);
+}
+.task-control-remove {
+  border-color: rgba(248, 113, 113, 0.2);
+  background: rgba(127, 29, 29, 0.05);
+  color: #fda4af;
+}
+.task-control-remove:hover {
+  border-color: rgba(248, 113, 113, 0.42);
+  background: rgba(127, 29, 29, 0.22);
+  color: #fecdd3;
+}
+.task-control:focus-visible {
+  outline: 2px solid rgba(165, 180, 252, 0.75);
+  outline-offset: 2px;
+}
+.edit-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.7rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid rgba(129, 140, 248, 0.28);
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.09);
+  color: #c7d2fe;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+.edit-confirm-actions {
+  display: flex;
+  gap: 0.45rem;
+  flex-shrink: 0;
 }
 .truncate {
   overflow: hidden;
@@ -351,7 +539,6 @@ async function runTasks() {
 }
 .status {
   display: inline-block;
-  margin-left: 0.65rem;
   padding: 0.15rem 0.45rem;
   border-radius: 999px;
   background: #334155;
@@ -375,17 +562,68 @@ async function runTasks() {
   background: rgba(148, 163, 184, 0.2);
   color: #cbd5e1;
 }
-.message {
-  white-space: pre-wrap;
-  color: #fca5a5 !important;
+.task-file-name {
+  margin-top: 0 !important;
 }
-.remove {
-  border: 0;
-  align-self: start;
-  background: none;
+.task-row .message {
+  margin-top: 0.55rem;
+  white-space: pre-wrap;
+  color: var(--text-muted);
+}
+.task-row .message-success {
+  color: #6ee7b7;
+}
+.task-row .message-error {
   color: #fca5a5;
-  cursor: pointer;
-  flex-shrink: 0;
+}
+.task-row .message-cancelled {
+  color: #fbbf24;
+}
+.range-details {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.08);
+}
+.range-details-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  color: #e0e7ff;
+  font-size: 0.82rem;
+}
+.range-details-header span {
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+.range-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 14rem;
+  margin-top: 0.6rem;
+  overflow-y: auto;
+}
+.range-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.55);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+.range-item code {
+  color: #e2e8f0;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.range-empty {
+  margin-top: 0.6rem !important;
 }
 .btn-danger {
   background: #7f1d1d;
@@ -450,5 +688,14 @@ async function runTasks() {
   color: var(--text-muted);
   font-size: 0.78rem;
   cursor: pointer;
+}
+@media (max-width: 720px) {
+  .task-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .task-row-actions {
+    margin-left: auto;
+  }
 }
 </style>

@@ -4,7 +4,19 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useRouter } from 'vue-router'
-import { newTaskId, normaliseVideoPath, processedVideos, videoTasks, type ClipMethod, type CombineMode, type TaskKind, type VideoSegment, type VideoTask } from '../taskStore'
+import {
+  newTaskId,
+  normaliseVideoPath,
+  processedVideos,
+  takeTaskEditRequest,
+  videoTasks,
+  type ClipMethod,
+  type CombineMode,
+  type TaskKind,
+  type TaskPreviewTimeline,
+  type VideoSegment,
+  type VideoTask,
+} from '../taskStore'
 
 interface ThumbnailItem {
   time: number
@@ -49,11 +61,21 @@ const progressPercent = ref(0)
 // The visible layout is always editable. Rows are increased automatically when more images are inserted.
 const gridCols = ref(7)
 const gridRows = ref(5)
+const initialCaptureMode = ref<'grid' | 'interval'>('grid')
+const initialInterval = ref(4)
 const initialGridSlotCount = computed(() => Math.max(1, Math.floor(Number(gridCols.value) || 1) * Math.floor(Number(gridRows.value) || 1)))
 const initialThumbnailCount = computed(() => Math.max(0, initialGridSlotCount.value - 2))
+const intervalThumbnailCount = computed(() => {
+  const interval = Number(initialInterval.value)
+  if (!Number.isFinite(interval) || interval <= 0 || !Number.isFinite(videoDuration.value) || videoDuration.value <= 0) return 0
+  return Math.max(0, Math.ceil((videoDuration.value - 0.0005) / interval) - 1)
+})
+const plannedThumbnailCount = computed(() => initialCaptureMode.value === 'grid' ? initialThumbnailCount.value : intervalThumbnailCount.value)
 const thumbnails = ref<ThumbnailItem[]>([])
 const startThumbnail = ref<string | null>(null)
 const endThumbnail = ref<string | null>(null)
+const showStartEndpoint = ref(true)
+const showEndEndpoint = ref(true)
 const activeModalIndex = ref<number | null>(null)
 const modalImageSize = ref<ModalImageSize>('fit')
 const selectedTimes = ref<number[]>([])
@@ -64,6 +86,9 @@ const expansionCols = ref(2)
 const expansionRows = ref(2)
 const expansionQueue = ref<ExpansionJob[]>([])
 const videoDuration = ref(0)
+const durationLoading = ref(false)
+const durationLoadFailed = ref(false)
+let durationRequestSerial = 0
 const activePanel = ref<'load' | 'task' | 'combine'>('load')
 const combineFiles = ref<string[]>([])
 const combineDragFromIndex = ref<number | null>(null)
@@ -102,6 +127,9 @@ const taskExtension = ref('mp4')
 const taskExtraArgs = ref('')
 const taskPreciseSeek = ref(true)
 const taskKeepSegments = ref(false)
+const editingTaskId = ref<string | null>(null)
+const editingCreatesCopy = ref(false)
+const editingTask = computed(() => (editingTaskId.value ? videoTasks.find((task) => task.id === editingTaskId.value) ?? null : null))
 
 // Requires exactly two ADJACENT thumbnails (by CURRENT array position — resolved live, since another
 // job inserting thumbnails elsewhere can shift indices while this selection is still pending) — only
@@ -150,17 +178,83 @@ const lockedTimeSet = computed(() => {
 // Ordered start → thumbnails → end sequence backing the enlarged-preview prev/next navigation and filmstrip.
 const modalSequence = computed(() => {
   const list: { time: number; src: string; label: string }[] = []
-  if (startThumbnail.value) list.push({ time: 0, src: startThumbnail.value, label: '起點' })
+  if (showStartEndpoint.value && startThumbnail.value) list.push({ time: 0, src: startThumbnail.value, label: '起點' })
   for (const item of thumbnails.value) list.push({ time: item.time, src: item.base64, label: item.timeStr })
-  if (endThumbnail.value) list.push({ time: videoDuration.value, src: endThumbnail.value, label: '終點' })
+  if (showEndEndpoint.value && endThumbnail.value) list.push({ time: videoDuration.value, src: endThumbnail.value, label: '終點' })
   return list
 })
 const activeModalItem = computed(() => (activeModalIndex.value !== null ? (modalSequence.value[activeModalIndex.value] ?? null) : null))
 
-// Auto-scroll the filmstrip so the active item is in view — covers opening the modal, prev/next
-// navigation, and clicking a different filmstrip thumbnail, since all of those just change this index.
-const filmstripItemRefs = ref<HTMLElement[]>([])
+// The grid and filmstrip retain every time point, but only mount images near the viewport.
+const gridRef = ref<HTMLElement | null>(null)
+const gridScrollTop = ref(0)
+const gridWidth = ref(0)
+const gridHeight = ref(0)
+let gridResizeObserver: ResizeObserver | null = null
+const gridSequence = computed(() => [
+  ...(showStartEndpoint.value ? [{ time: 0, src: startThumbnail.value, label: '00:00:00', endpoint: true }] : []),
+  ...thumbnails.value.map((item) => ({ time: item.time, src: item.base64, label: item.timeStr, endpoint: false })),
+  ...(showEndEndpoint.value ? [{ time: videoDuration.value, src: endThumbnail.value, label: formatSeconds(videoDuration.value), endpoint: true }] : []),
+])
+const hasPreviewContent = computed(() => Boolean(thumbnails.value.length || startThumbnail.value || endThumbnail.value || isProcessing.value || isEndpointProcessing.value))
+const previewDisplayCount = computed(() => (hasPreviewContent.value ? gridSequence.value.length : 0))
+const gridColumnCount = computed(() => Math.max(1, Math.floor(Number(gridCols.value) || 1)))
+const gridRowPitch = computed(() => {
+  const contentWidth = Math.max(1, gridWidth.value - 9)
+  const itemWidth = Math.max(1, (contentWidth - (gridColumnCount.value - 1) * 3) / gridColumnCount.value)
+  return Math.ceil(itemWidth * 9 / 16 + 26 + 3)
+})
+const gridTotalRows = computed(() => Math.ceil(gridSequence.value.length / gridColumnCount.value))
+const gridFirstRow = computed(() => Math.max(0, Math.floor(gridScrollTop.value / gridRowPitch.value) - 3))
+const gridLastRow = computed(() => Math.min(gridTotalRows.value, Math.ceil((gridScrollTop.value + gridHeight.value) / gridRowPitch.value) + 3))
+const visibleGridItems = computed(() => gridSequence.value.slice(gridFirstRow.value * gridColumnCount.value, gridLastRow.value * gridColumnCount.value)
+  .map((item, offset) => ({ ...item, index: gridFirstRow.value * gridColumnCount.value + offset })))
+const gridCanvasHeight = computed(() => gridTotalRows.value * gridRowPitch.value)
+
+function measureGrid() {
+  const container = gridRef.value
+  if (!container) return
+  gridWidth.value = container.clientWidth
+  gridHeight.value = container.clientHeight
+  gridScrollTop.value = container.scrollTop
+}
+function onGridScroll() {
+  if (gridRef.value) gridScrollTop.value = gridRef.value.scrollTop
+}
+watch(gridRef, (element) => {
+  gridResizeObserver?.disconnect()
+  gridResizeObserver = null
+  if (!element) return
+  gridResizeObserver = new ResizeObserver(measureGrid)
+  gridResizeObserver.observe(element)
+  nextTick(measureGrid)
+})
+
 const filmstripRef = ref<HTMLElement | null>(null)
+const filmstripScrollLeft = ref(0)
+const filmstripWidth = ref(0)
+const filmstripPitch = 286
+let filmstripResizeObserver: ResizeObserver | null = null
+const filmstripFirst = computed(() => Math.max(0, Math.floor(filmstripScrollLeft.value / filmstripPitch) - 3))
+const filmstripLast = computed(() => Math.min(modalSequence.value.length, Math.ceil((filmstripScrollLeft.value + filmstripWidth.value) / filmstripPitch) + 3))
+const visibleFilmstripItems = computed(() => modalSequence.value.slice(filmstripFirst.value, filmstripLast.value)
+  .map((item, offset) => ({ ...item, index: filmstripFirst.value + offset })))
+function measureFilmstrip() {
+  if (!filmstripRef.value) return
+  filmstripWidth.value = filmstripRef.value.clientWidth
+  filmstripScrollLeft.value = filmstripRef.value.scrollLeft
+}
+function onFilmstripScroll() {
+  if (filmstripRef.value) filmstripScrollLeft.value = filmstripRef.value.scrollLeft
+}
+watch(filmstripRef, (element) => {
+  filmstripResizeObserver?.disconnect()
+  filmstripResizeObserver = null
+  if (!element) return
+  filmstripResizeObserver = new ResizeObserver(measureFilmstrip)
+  filmstripResizeObserver.observe(element)
+  nextTick(measureFilmstrip)
+})
 let filmstripScrollFrame: number | null = null
 
 function cancelFilmstripScrollAnimation() {
@@ -172,12 +266,11 @@ function cancelFilmstripScrollAnimation() {
 
 function scrollFilmstripToItem(index: number) {
   const container = filmstripRef.value
-  const item = filmstripItemRefs.value[index]
-  if (!container || !item) return
+  if (!container) return
 
   cancelFilmstripScrollAnimation()
   const maxScrollLeft = Math.max(0, container.scrollWidth - container.clientWidth)
-  const targetLeft = Math.max(0, Math.min(item.offsetLeft - (container.clientWidth - item.offsetWidth) / 2, maxScrollLeft))
+  const targetLeft = Math.max(0, Math.min(index * filmstripPitch + 140 - container.clientWidth / 2, maxScrollLeft))
   const startLeft = container.scrollLeft
   const distance = targetLeft - startLeft
   if (Math.abs(distance) < 1) return
@@ -270,9 +363,13 @@ onMounted(async () => {
   }
 })
 
-// Home is kept alive between routes, so restore the default load/source view whenever
-// the user returns to this page from another navigation item.
-onActivated(selectVideoFilePanel)
+// Home is kept alive between routes. A task edit request takes priority; otherwise returning to
+// this page restores the ordinary load/source view.
+onActivated(() => {
+  const taskId = takeTaskEditRequest()
+  if (taskId) void restoreTaskForEditing(taskId)
+  else selectVideoFilePanel()
+})
 
 onUnmounted(() => {
   unlistenDragDrop?.()
@@ -280,6 +377,8 @@ onUnmounted(() => {
   document.removeEventListener('click', handleDocumentClick)
   if (autoClearFinishedTimer) clearTimeout(autoClearFinishedTimer)
   cancelFilmstripScrollAnimation()
+  gridResizeObserver?.disconnect()
+  filmstripResizeObserver?.disconnect()
 })
 
 defineExpose({ loadPaths })
@@ -307,6 +406,11 @@ function openModal(index: number) {
   activeModalIndex.value = index
 }
 
+function openModalForTime(time: number) {
+  const index = modalSequence.value.findIndex((item) => item.time === time)
+  if (index !== -1) openModal(index)
+}
+
 function toggleModalImageSize() {
   modalImageSize.value = modalImageSize.value === 'fit' ? 'original' : 'fit'
 }
@@ -323,7 +427,7 @@ function modalGoNext() {
 
 function normaliseLayout() {
   gridCols.value = Math.max(1, Math.floor(gridCols.value || 1))
-  gridRows.value = Math.max(1, Math.ceil(thumbnails.value.length / gridCols.value))
+  gridRows.value = Math.max(1, Math.ceil(gridSequence.value.length / gridCols.value))
 }
 
 function updateLayoutFromUser() {
@@ -344,7 +448,7 @@ function loadGridPreference() {
 
 function applyCurrentLayout() {
   updateLayoutFromUser()
-  const minimumRows = Math.max(1, Math.ceil(thumbnails.value.length / gridCols.value))
+  const minimumRows = Math.max(1, Math.ceil(gridSequence.value.length / gridCols.value))
   if (gridRows.value < minimumRows) gridRows.value = minimumRows
   addLog(`目前縮圖排列已設為 ${gridCols.value} × ${gridRows.value}。`)
 }
@@ -358,14 +462,37 @@ function loadVideoFromPath(path: string) {
   thumbnails.value = []
   startThumbnail.value = null
   endThumbnail.value = null
+  showStartEndpoint.value = true
+  showEndEndpoint.value = true
   videoDuration.value = 0
   expansionQueue.value = []
   selectedTimes.value = []
+  gridScrollTop.value = 0
   taskOutputName.value = `${baseNameWithoutExt(path)}${taskNameSuffix.value}`
   taskOutputNameAuto.value = true
   taskSourceMode.value = 'original'
   taskSourceProcessedId.value = ''
+  editingTaskId.value = null
+  editingCreatesCopy.value = false
   addLog(`已選擇影片：${path}`)
+  void loadVideoDuration(path)
+}
+
+async function loadVideoDuration(path: string) {
+  const serial = ++durationRequestSerial
+  durationLoading.value = true
+  durationLoadFailed.value = false
+  try {
+    const duration = await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: path })
+    if (serial === durationRequestSerial && videoPath.value === path) videoDuration.value = duration
+  } catch (error) {
+    if (serial === durationRequestSerial) {
+      durationLoadFailed.value = true
+      addLog(`無法預先讀取影片長度：${String(error)}`)
+    }
+  } finally {
+    if (serial === durationRequestSerial) durationLoading.value = false
+  }
 }
 
 async function selectVideo() {
@@ -455,14 +582,20 @@ function useProcessedVideo(task: VideoTask) {
   thumbnails.value = []
   startThumbnail.value = null
   endThumbnail.value = null
+  showStartEndpoint.value = true
+  showEndEndpoint.value = true
   videoDuration.value = 0
   expansionQueue.value = []
   selectedTimes.value = []
+  gridScrollTop.value = 0
   taskOutputName.value = `${baseNameWithoutExt(task.source)}${taskNameSuffix.value}`
   taskOutputNameAuto.value = true
   taskSourceMode.value = 'original'
   taskSourceProcessedId.value = ''
+  editingTaskId.value = null
+  editingCreatesCopy.value = false
   addLog(`已選擇處理過的影片：${task.resultPath}`)
+  void loadVideoDuration(task.resultPath)
 }
 
 function removeProcessedVideo(id: string) {
@@ -494,9 +627,12 @@ function resetThumbnailPreview() {
   thumbnails.value = []
   startThumbnail.value = null
   endThumbnail.value = null
+  showStartEndpoint.value = true
+  showEndEndpoint.value = true
   videoDuration.value = 0
   expansionQueue.value = []
   selectedTimes.value = []
+  gridScrollTop.value = 0
   progressText.value = ''
   progressPercent.value = 0
 }
@@ -632,6 +768,10 @@ async function captureAtTimes(times: number[], offset: number, shouldStop?: () =
 
 async function generateGridThumbnails() {
   if (!videoPath.value) return addLog('請先選擇影片檔案。')
+  const interval = Number(initialInterval.value)
+  if (initialCaptureMode.value === 'interval' && (!Number.isFinite(interval) || interval < 0.1)) {
+    return addLog('請輸入至少 0.1 秒的有效截圖間隔。')
+  }
   updateLayoutFromUser()
   // The selected N × M layout includes the two endpoint cells. Only the remaining cells need
   // regular timeline captures; otherwise a 4 × 5 layout incorrectly renders 22 images.
@@ -642,13 +782,19 @@ async function generateGridThumbnails() {
   thumbnails.value = []
   startThumbnail.value = null
   endThumbnail.value = null
+  showStartEndpoint.value = true
+  showEndEndpoint.value = true
   selectedTimes.value = []
+  gridScrollTop.value = 0
   let initialCaptureSucceeded = false
   let duration = 0
   try {
     duration = await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: videoPath.value })
     videoDuration.value = duration
-    const times = Array.from({ length: count }, (_, index) => ((index + 1) * duration) / (count + 1))
+    const actualCount = initialCaptureMode.value === 'grid' ? count : Math.max(0, Math.ceil((duration - 0.0005) / interval) - 1)
+    const times = Array.from({ length: actualCount }, (_, index) => initialCaptureMode.value === 'grid'
+      ? ((index + 1) * duration) / (actualCount + 1)
+      : (index + 1) * interval)
     await captureAtTimes(times, 0, () => initialCaptureCancelRequested.value, (item) => {
       thumbnails.value.push(item)
     })
@@ -682,31 +828,42 @@ function cancelInitialThumbnailCapture() {
 }
 
 async function captureEndpointThumbnails(duration: number) {
+  if (!showStartEndpoint.value && !showEndEndpoint.value) return
   isEndpointProcessing.value = true
   addLog('開始背景擷取起點與終點縮圖；這不會阻塞擴充佇列。')
   try {
     const endpointResults = await Promise.allSettled([
-      captureThumbnail({
-        ffmpegPath: ffmpegPath.value || null,
-        videoPath: videoPath.value,
-        time: '0.000',
-        index: -1,
-      }),
-      captureThumbnail({
-        ffmpegPath: ffmpegPath.value || null,
-        videoPath: videoPath.value,
-        // Stay a little farther inside the file than the container's reported end. Some long MP4s
-        // report a final timestamp for which input-side seek produces an empty image.
-        time: Math.max(0, duration - 2).toFixed(3),
-        index: -2,
-      }),
+      showStartEndpoint.value
+        ? captureThumbnail({
+            ffmpegPath: ffmpegPath.value || null,
+            videoPath: videoPath.value,
+            time: '0.000',
+            index: -1,
+          })
+        : Promise.resolve(null),
+      showEndEndpoint.value
+        ? captureThumbnail({
+            ffmpegPath: ffmpegPath.value || null,
+            videoPath: videoPath.value,
+            // Stay a little farther inside the file than the container's reported end. Some long MP4s
+            // report a final timestamp for which input-side seek produces an empty image.
+            time: Math.max(0, duration - 2).toFixed(3),
+            index: -2,
+          })
+        : Promise.resolve(null),
     ])
     const [startResult, endResult] = endpointResults
-    if (startResult.status === 'fulfilled') startThumbnail.value = `data:image/jpeg;base64,${startResult.value}`
-    else addLog(`起點縮圖擷取失敗：${String(startResult.reason)}`)
-    if (endResult.status === 'fulfilled') endThumbnail.value = `data:image/jpeg;base64,${endResult.value}`
-    else addLog(`終點縮圖擷取失敗：${String(endResult.reason)}`)
-    if (startResult.status === 'fulfilled' && endResult.status === 'fulfilled') addLog('起點與終點縮圖已完成。')
+    if (showStartEndpoint.value) {
+      if (startResult.status === 'fulfilled' && startResult.value) startThumbnail.value = `data:image/jpeg;base64,${startResult.value}`
+      else if (startResult.status === 'rejected') addLog(`起點縮圖擷取失敗：${String(startResult.reason)}`)
+    }
+    if (showEndEndpoint.value) {
+      if (endResult.status === 'fulfilled' && endResult.value) endThumbnail.value = `data:image/jpeg;base64,${endResult.value}`
+      else if (endResult.status === 'rejected') addLog(`終點縮圖擷取失敗：${String(endResult.reason)}`)
+    }
+    const startDone = !showStartEndpoint.value || (startResult.status === 'fulfilled' && Boolean(startResult.value))
+    const endDone = !showEndEndpoint.value || (endResult.status === 'fulfilled' && Boolean(endResult.value))
+    if (startDone && endDone) addLog('端點縮圖已完成。')
   } finally {
     isEndpointProcessing.value = false
   }
@@ -719,6 +876,130 @@ function toggleSelection(time: number) {
   }
   if (selectedTimes.value.length === 2) selectedTimes.value = [time]
   else selectedTimes.value = [...selectedTimes.value, time]
+}
+
+function removeSelectedPreviewRange() {
+  if (!selectedTimeRange.value) return addLog('請先選擇兩張縮圖作為移除範圍。')
+  if (isProcessing.value || isEndpointProcessing.value || isExpanding.value || expansionQueue.value.some((job) => job.status === '等待中' || job.status === '處理中')) {
+    return addLog('目前仍有縮圖任務進行中，請等待完成或取消後再移除範圍。')
+  }
+  const { start, end } = selectedTimeRange.value
+  const before = thumbnails.value.length
+  thumbnails.value = thumbnails.value.filter((item) => item.time < start || item.time > end)
+  let removedCount = before - thumbnails.value.length
+  if (showStartEndpoint.value && start <= 0 && end >= 0) {
+    showStartEndpoint.value = false
+    startThumbnail.value = null
+    removedCount += 1
+  }
+  if (showEndEndpoint.value && start <= videoDuration.value && end >= videoDuration.value) {
+    showEndEndpoint.value = false
+    endThumbnail.value = null
+    removedCount += 1
+  }
+  selectedTimes.value = []
+  activeModalIndex.value = null
+  gridScrollTop.value = 0
+  if (gridRef.value) gridRef.value.scrollTop = 0
+  normaliseLayout()
+  addLog(`已移除 ${formatSeconds(start)} → ${formatSeconds(end)} 範圍內共 ${removedCount} 張縮圖（包含兩端）。`)
+}
+
+async function restoreTaskForEditing(taskId: string) {
+  const task = videoTasks.find((item) => item.id === taskId)
+  if (!task || (task.kind !== 'clip' && task.kind !== 'merge')) {
+    addLog('找不到可再編輯的剪輯任務。')
+    selectVideoFilePanel()
+    return
+  }
+  if (task.status === '處理中') {
+    addLog('處理中的任務無法再編輯，請先等待完成或停止任務。')
+    selectVideoFilePanel()
+    return
+  }
+  if (isProcessing.value || isEndpointProcessing.value || isExpanding.value) {
+    addLog('目前仍有縮圖正在處理，請等待完成或取消後再開啟任務。')
+    return
+  }
+
+  loadPaths()
+  editingTaskId.value = task.id
+  editingCreatesCopy.value = task.status !== '等待中'
+  videoPath.value = task.source
+  originalSourcePath.value = task.source
+  thumbnails.value = []
+  startThumbnail.value = null
+  endThumbnail.value = null
+  expansionQueue.value = []
+  activeModalIndex.value = null
+  gridScrollTop.value = 0
+  taskKind.value = task.kind
+  taskMethod.value = task.method
+  taskDurationHours.value = task.durationHours
+  taskSplitCount.value = task.splitCount
+  taskOutputName.value = editingCreatesCopy.value ? `${task.outputName}${taskNameSuffix.value}` : task.outputName
+  taskOutputNameAuto.value = false
+  taskExtension.value = task.extension
+  taskExtraArgs.value = task.extraArgs
+  taskPreciseSeek.value = task.preciseSeek
+  taskKeepSegments.value = task.keepSegments
+  taskSourceMode.value = 'original'
+  taskSourceProcessedId.value = ''
+  mergeSegments.value = task.kind === 'merge' ? task.segments.map((segment) => ({ ...segment })) : []
+  selectedTimes.value = task.kind === 'clip' && task.method === 'range' && task.segments[0]
+    ? [task.segments[0].start, task.segments[0].end]
+    : []
+
+  const timeline = task.previewTimeline
+  if (!timeline?.times.length || !timeline.duration) {
+    showStartEndpoint.value = true
+    showEndEndpoint.value = true
+    videoDuration.value = 0
+    loadGridPreference()
+    activePanel.value = 'load'
+    loadSubPanel.value = 'init'
+    addLog('這筆舊任務沒有保存縮圖時間軸；請重新建立縮圖後再修改任務。')
+    void loadVideoDuration(task.source)
+    return
+  }
+
+  videoDuration.value = timeline.duration
+  gridCols.value = Math.max(1, Math.floor(timeline.gridCols || 1))
+  const times = [...new Set(timeline.times.map(roundPreviewTime))].sort((a, b) => a - b)
+  showStartEndpoint.value = times.some((time) => time === 0)
+  showEndEndpoint.value = times.some((time) => Math.abs(time - timeline.duration) <= 0.0005)
+  const middleTimes = times.filter((time) => time > 0 && time < timeline.duration)
+  normaliseLayout()
+  activePanel.value = 'load'
+  loadSubPanel.value = 'init'
+  isProcessing.value = true
+  initialCaptureCancelRequested.value = false
+  addLog(`正在依任務保存的 ${times.length} 個時間點重新建立縮圖。`)
+  let completed = false
+  try {
+    await captureAtTimes(middleTimes, 0, () => initialCaptureCancelRequested.value, (item) => {
+      thumbnails.value.push(item)
+    })
+    completed = !initialCaptureCancelRequested.value
+    normaliseLayout()
+    if (completed) addLog(`已恢復 ${thumbnails.value.length} 張中間縮圖，可繼續調整任務。`)
+    else addLog(`已取消恢復縮圖，保留已完成的 ${thumbnails.value.length} 張。`)
+  } catch (error) {
+    addLog(`恢復任務縮圖失敗：${String(error)}`)
+  } finally {
+    isProcessing.value = false
+    initialCaptureCancelRequested.value = false
+    progressText.value = ''
+    progressPercent.value = 0
+    activePanel.value = 'task'
+    if (completed) void captureEndpointThumbnails(timeline.duration)
+  }
+}
+
+function cancelTaskEditing() {
+  editingTaskId.value = null
+  editingCreatesCopy.value = false
+  router.push('/tasks')
 }
 
 // Live preview only (uses the current UI selections) — actual execution uses buildTimesForJob below.
@@ -907,64 +1188,103 @@ function onSegmentDrop(index: number) {
   dragFromIndex.value = null
 }
 
+function roundPreviewTime(time: number) {
+  return Math.round(time * 1000) / 1000
+}
+
+function buildPreviewTimeline(): TaskPreviewTimeline | undefined {
+  if (!videoDuration.value || !hasPreviewContent.value) return undefined
+  const times = [...new Set(gridSequence.value.map((item) => roundPreviewTime(item.time)))].sort((a, b) => a - b)
+  return {
+    duration: roundPreviewTime(videoDuration.value),
+    times,
+    gridCols: Math.max(1, Math.floor(gridCols.value || 1)),
+  }
+}
+
+function buildCalculatedClipSegments(method: ClipMethod): VideoSegment[] {
+  const duration = videoDuration.value
+  if (!Number.isFinite(duration) || duration <= 0) return []
+  if (method === 'duration') {
+    const segmentDuration = Number(taskDurationHours.value) * 3600
+    if (!Number.isFinite(segmentDuration) || segmentDuration <= 0) return []
+    return Array.from({ length: Math.ceil(duration / segmentDuration) }, (_, index) => ({
+      start: index * segmentDuration,
+      end: Math.min(duration, (index + 1) * segmentDuration),
+    }))
+  }
+  if (method === 'count') {
+    const count = Math.max(1, Math.floor(Number(taskSplitCount.value) || 1))
+    return Array.from({ length: count }, (_, index) => ({
+      start: (duration * index) / count,
+      end: (duration * (index + 1)) / count,
+    }))
+  }
+  return []
+}
+
+function saveTaskFromEditor(kind: 'clip' | 'merge', segments: VideoSegment[]) {
+  const sourceTask = editingTask.value
+  const task: VideoTask = {
+    id: newTaskId(),
+    kind,
+    method: kind === 'merge' ? 'range' : taskMethod.value,
+    source: taskSourcePath.value,
+    segments: segments.map((segment) => ({ start: roundPreviewTime(segment.start), end: roundPreviewTime(segment.end) })),
+    durationHours: taskDurationHours.value,
+    splitCount: taskSplitCount.value,
+    outputName: taskOutputName.value.trim() || (kind === 'clip' ? 'clip' : 'merged_video'),
+    extension: taskExtension.value.trim() || 'mp4',
+    extraArgs: taskExtraArgs.value,
+    keepSegments: taskKeepSegments.value,
+    outputDir: sourceTask?.outputDir || '',
+    resultPath: '',
+    preciseSeek: taskPreciseSeek.value,
+    combineSources: [],
+    combineMode: 'copy',
+    status: '等待中',
+    message: '',
+    previewTimeline: buildPreviewTimeline(),
+  }
+
+  const shouldUpdateExisting = Boolean(sourceTask && !editingCreatesCopy.value && sourceTask.status === '等待中')
+  if (shouldUpdateExisting && sourceTask) {
+    Object.assign(sourceTask, task, { id: sourceTask.id })
+    addLog(`已更新任務：${task.outputName}。`)
+  } else {
+    videoTasks.push(task)
+    addLog(editingTaskId.value ? `已從原任務建立新的編輯任務：${task.outputName}。` : `已建立任務：${task.outputName}。`)
+  }
+
+  editingTaskId.value = null
+  editingCreatesCopy.value = false
+  selectedTimes.value = []
+  mergeSegments.value = []
+  router.push('/tasks')
+}
+
 function createClipTask() {
   if (!taskSourcePath.value) return addLog('請先選擇影片檔案，或選擇要使用的已處理影片。')
   let segments: VideoSegment[] = []
   if (taskMethod.value === 'range') {
     if (!selectedTimeRange.value) return addLog('請先在縮圖中選擇兩個時間點作為剪輯範圍。')
     segments = [{ start: selectedTimeRange.value.start, end: selectedTimeRange.value.end }]
+  } else {
+    if (taskMethod.value === 'duration' && (!Number.isFinite(Number(taskDurationHours.value)) || Number(taskDurationHours.value) <= 0)) {
+      return addLog('請輸入有效的分段時間長度。')
+    }
+    if (taskMethod.value === 'count' && (!Number.isFinite(Number(taskSplitCount.value)) || Number(taskSplitCount.value) < 2)) {
+      return addLog('分割數量至少需要 2 段。')
+    }
+    segments = buildCalculatedClipSegments(taskMethod.value)
   }
-  videoTasks.push({
-    id: newTaskId(),
-    kind: 'clip',
-    method: taskMethod.value,
-    source: taskSourcePath.value,
-    segments,
-    durationHours: taskDurationHours.value,
-    splitCount: taskSplitCount.value,
-    outputName: taskOutputName.value.trim() || 'clip',
-    extension: taskExtension.value.trim() || 'mp4',
-    extraArgs: taskExtraArgs.value,
-    keepSegments: taskKeepSegments.value,
-    outputDir: '',
-    resultPath: '',
-    preciseSeek: taskPreciseSeek.value,
-    combineSources: [],
-    combineMode: 'copy',
-    status: '等待中',
-    message: '',
-  })
-  addLog(`已建立剪輯任務：${taskOutputName.value}，前往「影片處理任務」執行。`)
-  selectedTimes.value = []
-  router.push('/tasks')
+  saveTaskFromEditor('clip', segments)
 }
 
 function createMergeTask() {
   if (!taskSourcePath.value) return addLog('請先選擇影片檔案，或選擇要使用的已處理影片。')
   if (mergeSegments.value.length < 2) return addLog('請至少加入兩個片段才能建立剪輯＋合併任務。')
-  videoTasks.push({
-    id: newTaskId(),
-    kind: 'merge',
-    method: 'range',
-    source: taskSourcePath.value,
-    segments: mergeSegments.value.map((segment) => ({ ...segment })),
-    durationHours: taskDurationHours.value,
-    splitCount: taskSplitCount.value,
-    outputName: taskOutputName.value.trim() || 'merged_video',
-    extension: taskExtension.value.trim() || 'mp4',
-    extraArgs: taskExtraArgs.value,
-    keepSegments: taskKeepSegments.value,
-    outputDir: '',
-    resultPath: '',
-    preciseSeek: taskPreciseSeek.value,
-    combineSources: [],
-    combineMode: 'copy',
-    status: '等待中',
-    message: '',
-  })
-  addLog(`已建立剪輯＋合併任務，共 ${mergeSegments.value.length} 段，前往「影片處理任務」執行。`)
-  mergeSegments.value = []
-  router.push('/tasks')
+  saveTaskFromEditor('merge', mergeSegments.value)
 }
 
 async function selectFilesToCombine() {
@@ -1090,11 +1410,22 @@ function createCombineTask() {
 
         <div v-if="loadSubPanel !== 'source'" class="load-panel-capture-area">
           <div v-if="loadSubPanel === 'init'" class="subsection capture-section">
-          <div class="row">
+          <div class="mode-row">
+            <label><input v-model="initialCaptureMode" type="radio" value="grid" /> 依欄列等分</label>
+            <label><input v-model="initialCaptureMode" type="radio" value="interval" /> 指定截圖間隔</label>
+          </div>
+          <div v-if="initialCaptureMode === 'grid'" class="row">
             <div class="col input-group"><label>欄（N）</label><input v-model.number="gridCols" type="number" min="1" @change="updateLayoutFromUser" /></div>
             <div class="col input-group"><label>列（M）</label><input v-model.number="gridRows" type="number" min="1" @change="updateLayoutFromUser" /></div>
           </div>
-          <p class="info-text">初始擷取 {{ initialThumbnailCount }} 張中間縮圖，連同起點與終點共 {{ initialGridSlotCount }} 格；之後可隨時自行改為任意 N × M 排列。</p>
+          <div v-else class="input-group">
+            <label>每隔幾秒擷取一張</label><input v-model.number="initialInterval" type="number" min="0.1" step="0.1" />
+          </div>
+          <p v-if="initialCaptureMode === 'grid'" class="info-text">初始擷取 {{ initialThumbnailCount }} 張中間縮圖，連同起點與終點共 {{ initialGridSlotCount }} 格；之後可隨時自行改為任意 N × M 排列。</p>
+          <p v-else class="info-text">
+            {{ durationLoadFailed ? '無法預先讀取影片長度；請確認影片與 ffprobe 設定。' : durationLoading || !videoDuration ? '正在讀取影片長度，以計算縮圖張數…' : `影片長度 ${formatSeconds(videoDuration)}；預計擷取 ${plannedThumbnailCount} 張中間縮圖，加上起點與終點共 ${plannedThumbnailCount + 2} 格。` }}
+          </p>
+          <p v-if="initialCaptureMode === 'interval' && plannedThumbnailCount >= 1000" class="info-text">大量縮圖需要較長擷取時間；可隨時取消，已完成的縮圖會保留。</p>
           <button
             v-if="isProcessing"
             class="btn btn-danger w-full"
@@ -1179,7 +1510,13 @@ function createCombineTask() {
       </section>
 
       <section v-if="activePanel === 'task'" class="card task-builder-card">
-        <h2 class="card-title">建立處理任務</h2>
+        <div class="card-header-with-btn">
+          <h2 class="card-title">{{ editingTaskId ? '再編輯處理任務' : '建立處理任務' }}</h2>
+          <button v-if="editingTaskId" class="btn-clear" @click="cancelTaskEditing">取消再編輯</button>
+        </div>
+        <p v-if="editingTaskId" class="edit-task-notice">
+          {{ editingCreatesCopy ? '原任務會保留；儲存後將建立一筆新的等待任務，輸出檔名已自動加上後綴。' : '儲存後會直接更新這筆等待中的任務。' }}
+        </p>
         <div class="mode-row">
           <label><input v-model="taskKind" type="radio" value="clip" /> 剪輯</label>
           <label><input v-model="taskKind" type="radio" value="merge" /> 剪輯＋合併</label>
@@ -1198,7 +1535,7 @@ function createCombineTask() {
             <option v-for="task in processedVideos" :key="task.id" :value="task.id">{{ task.outputName }}.{{ task.extension }}</option>
           </select>
           <p class="selection-summary break-all" :class="{ muted: !taskSourcePath }">
-            {{ taskSourcePath ? `將對「${baseName(taskSourcePath)}」建立任務` : '尚未選擇來源影片' }}
+            {{ taskSourcePath ? `將對「${baseName(taskSourcePath)}」${editingTaskId ? '儲存修改' : '建立任務'}` : '尚未選擇來源影片' }}
           </p>
         </div>
 
@@ -1252,8 +1589,12 @@ function createCombineTask() {
         <div class="input-group"><label>額外 ffmpeg 參數（合併時套用，以空白分隔）</label><input v-model="taskExtraArgs" placeholder="例如：-crf 20" /></div>
         <label class="checkbox-row"><input v-model="taskPreciseSeek" type="checkbox" /> 精確 seek（較慢，適合時間戳異常的長時間錄影）</label>
 
-        <button v-if="taskKind === 'clip'" class="btn btn-primary btn-glow w-full" @click="createClipTask">建立剪輯任務</button>
-        <button v-else class="btn btn-primary btn-glow w-full" :disabled="mergeSegments.length < 2" @click="createMergeTask">建立剪輯＋合併任務</button>
+        <button v-if="taskKind === 'clip'" class="btn btn-primary btn-glow w-full" @click="createClipTask">
+          {{ editingTaskId ? (editingCreatesCopy ? '另存新的剪輯任務' : '儲存剪輯任務修改') : '建立剪輯任務' }}
+        </button>
+        <button v-else class="btn btn-primary btn-glow w-full" :disabled="mergeSegments.length < 2" @click="createMergeTask">
+          {{ editingTaskId ? (editingCreatesCopy ? '另存新的剪輯＋合併任務' : '儲存剪輯＋合併任務修改') : '建立剪輯＋合併任務' }}
+        </button>
       </section>
 
       <section v-if="activePanel === 'combine'" class="card">
@@ -1297,58 +1638,42 @@ function createCombineTask() {
     <div class="preview-log-panel">
       <section class="card preview-card">
         <div class="card-header-with-btn">
-          <h2 class="card-title">縮圖列表（{{ thumbnails.length }} 張）</h2>
+          <h2 class="card-title">縮圖列表（{{ previewDisplayCount }} 張）</h2>
         </div>
-        <div v-if="thumbnails.length" class="current-layout-controls">
+        <div v-if="hasPreviewContent" class="current-layout-controls">
           <span>目前顯示排列</span>
           <label>欄 N <input v-model.number="gridCols" type="number" min="1" /></label>
           <span>×</span>
           <label>列 M <input v-model.number="gridRows" type="number" min="1" /></label>
           <button class="btn btn-primary compact" @click="applyCurrentLayout">套用排列</button>
-          <template v-if="taskKind === 'merge' && selectedTimeRange">
+          <template v-if="selectedTimeRange">
             <span class="row-divider">|</span>
             <span>已選擇範圍：{{ formatSeconds(selectedTimeRange.start) }} → {{ formatSeconds(selectedTimeRange.end) }}</span>
-            <button class="btn btn-primary compact" @click="addSegmentToMergeList">＋ 加入合併清單</button>
+            <button class="btn btn-danger compact" @click="removeSelectedPreviewRange">移除範圍內縮圖（含兩端）</button>
+            <button v-if="taskKind === 'merge'" class="btn btn-primary compact" @click="addSegmentToMergeList">＋ 加入合併清單</button>
           </template>
         </div>
-        <p class="info-text">點一下選取，點兩下檢視原圖。擴充後會自動增加列數以容納新縮圖。</p>
-        <div v-if="thumbnails.length" class="grid-container" :style="{ gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))` }">
-          <div
-            class="grid-item-img endpoint"
-            :class="{ selected: selectedTimes.includes(0), 'in-segment': mergeSegments.length > 0 && isInMergeSegment(0), locked: lockedTimeSet.has(0) }"
-            @click="toggleSelection(0)"
-            @dblclick="startThumbnail && openModal(0)"
-          >
-            <div class="img-wrapper"><img v-if="startThumbnail" :src="startThumbnail" alt="起點" /><span class="endpoint-label">起點</span></div>
-            <div class="time-tag">00:00:00</div>
-          </div>
-          <div
-            v-for="(item, index) in thumbnails"
-            :key="`${item.time}-${index}`"
-            class="grid-item-img"
-            :class="{
-              selected: selectedTimes.includes(item.time),
-              'in-segment': mergeSegments.length > 0 && isInMergeSegment(item.time),
-              locked: lockedTimeSet.has(item.time),
-            }"
-            @click="toggleSelection(item.time)"
-            @dblclick="openModal((startThumbnail ? 1 : 0) + index)"
-          >
-            <div class="img-wrapper"><img :src="item.base64" :alt="`縮圖 ${item.timeStr}`" /></div>
-            <div class="time-tag">{{ item.timeStr }}</div>
-          </div>
-          <div
-            class="grid-item-img endpoint"
-            :class="{
-              selected: selectedTimes.includes(videoDuration),
-              'in-segment': mergeSegments.length > 0 && isInMergeSegment(videoDuration),
-              locked: lockedTimeSet.has(videoDuration),
-            }"
-            @click="toggleSelection(videoDuration)"
-            @dblclick="endThumbnail && openModal(modalSequence.length - 1)"
-          >
-            <div class="img-wrapper"><img v-if="endThumbnail" :src="endThumbnail" alt="終點" /><span class="endpoint-label">終點</span></div>
-            <div class="time-tag">{{ formatSeconds(videoDuration) }}</div>
+        <p class="info-text">點一下選取，點兩下檢視原圖。選取任意兩張後可移除範圍內所有縮圖；擴充後會自動增加列數。</p>
+        <div v-if="hasPreviewContent" ref="gridRef" class="grid-container" @scroll.passive="onGridScroll">
+          <div class="grid-virtual-canvas" :style="{ height: `${gridCanvasHeight}px` }">
+            <div class="grid-visible-rows" :style="{ top: `${gridFirstRow * gridRowPitch}px`, gridTemplateColumns: `repeat(${gridColumnCount}, minmax(0, 1fr))`, gridAutoRows: `${gridRowPitch - 3}px` }">
+              <div
+                v-for="item in visibleGridItems"
+                :key="`${item.time}-${item.index}`"
+                class="grid-item-img"
+                :class="{
+                  endpoint: item.endpoint,
+                  selected: selectedTimes.includes(item.time),
+                  'in-segment': mergeSegments.length > 0 && isInMergeSegment(item.time),
+                  locked: lockedTimeSet.has(item.time),
+                }"
+                @click="toggleSelection(item.time)"
+                @dblclick="item.src && openModalForTime(item.time)"
+              >
+                <div class="img-wrapper"><img v-if="item.src" :src="item.src" :alt="`縮圖 ${item.label}`" /><span v-if="item.endpoint" class="endpoint-label">{{ item.time === 0 ? '起點' : '終點' }}</span></div>
+                <div class="time-tag">{{ item.label }}</div>
+              </div>
+            </div>
           </div>
         </div>
         <div v-else class="preview-placeholder">建立縮圖後會顯示在這裡。</div>
@@ -1372,18 +1697,19 @@ function createCombineTask() {
           <button class="modal-filmstrip-toggle" @click.stop="filmstripVisible = !filmstripVisible">{{ filmstripVisible ? '隱藏縮圖列 ▾' : '顯示縮圖列 ▸' }}</button>
         </div>
       </div>
-      <div v-if="filmstripVisible" ref="filmstripRef" class="modal-filmstrip">
+      <div v-if="filmstripVisible" ref="filmstripRef" class="modal-filmstrip" @scroll.passive="onFilmstripScroll">
+        <div class="filmstrip-spacer" :style="{ width: `${filmstripFirst * filmstripPitch}px` }"></div>
         <div
-          v-for="(item, index) in modalSequence"
-          :key="index"
-          ref="filmstripItemRefs"
+          v-for="item in visibleFilmstripItems"
+          :key="item.index"
           class="filmstrip-item"
-          :class="{ active: index === activeModalIndex }"
-          @click="activeModalIndex = index"
+          :class="{ active: item.index === activeModalIndex }"
+          @click="activeModalIndex = item.index"
         >
           <img :src="item.src" :alt="item.label" />
           <span class="filmstrip-time">{{ item.label }}</span>
         </div>
+        <div class="filmstrip-spacer" :style="{ width: `${(modalSequence.length - filmstripLast) * filmstripPitch}px` }"></div>
       </div>
     </div>
 
@@ -1815,6 +2141,16 @@ select:focus {
 .task-builder-card .row {
   margin-top: 1rem;
 }
+.edit-task-notice {
+  margin: -0.35rem 0 1rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.1);
+  color: #c7d2fe;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
 .checkbox-row {
   display: flex;
   align-items: center;
@@ -1997,13 +2333,21 @@ select:focus {
   font-size: 0.8rem;
 }
 .grid-container {
-  display: grid;
-  gap: 3px;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   padding: 3px;
   background: #020617;
+}
+.grid-virtual-canvas {
+  position: relative;
+}
+.grid-visible-rows {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: grid;
+  gap: 3px;
 }
 .grid-item-img {
   background: #000;
@@ -2027,7 +2371,7 @@ select:focus {
 }
 .img-wrapper {
   position: relative;
-  aspect-ratio: 16 / 9;
+  height: calc(100% - 22px);
 }
 .img-wrapper img {
   width: 100%;
@@ -2036,7 +2380,9 @@ select:focus {
   object-fit: cover;
 }
 .time-tag {
-  padding: 0.25rem;
+  height: 22px;
+  box-sizing: border-box;
+  padding: 3px;
   text-align: center;
   font: 0.7rem monospace;
   color: #e5e7eb;
@@ -2307,6 +2653,10 @@ select:focus {
   overflow-y: hidden;
   background: rgba(0, 0, 0, 0.55);
   border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+.filmstrip-spacer {
+  flex: 0 0 auto;
+  height: 1px;
 }
 .filmstrip-item {
   flex: 0 0 auto;

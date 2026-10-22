@@ -9,6 +9,11 @@ export interface VideoSegment {
   start: number
   end: number
 }
+export interface TaskPreviewTimeline {
+  duration: number
+  times: number[]
+  gridCols: number
+}
 export interface VideoTask {
   id: string
   kind: TaskKind
@@ -28,6 +33,9 @@ export interface VideoTask {
   combineMode: CombineMode
   status: TaskStatus
   message: string
+  // Only timeline metadata is persisted. Thumbnail image data is intentionally excluded so even
+  // very large previews do not consume hundreds of megabytes on disk.
+  previewTimeline?: TaskPreviewTimeline
 }
 
 const storageKey = 'vid_thumb_clipper_tasks'
@@ -61,6 +69,18 @@ watch(videoTasks, (value) => localStorage.setItem(storageKey, JSON.stringify(val
 
 export function newTaskId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+let pendingTaskEditId: string | null = null
+
+export function queueTaskEdit(id: string) {
+  pendingTaskEditId = id
+}
+
+export function takeTaskEditRequest() {
+  const id = pendingTaskEditId
+  pendingTaskEditId = null
+  return id
 }
 
 // Preprocess tasks that finished successfully — selectable back on the Home page as a video source.

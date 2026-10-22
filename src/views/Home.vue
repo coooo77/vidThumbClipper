@@ -178,9 +178,9 @@ const lockedTimeSet = computed(() => {
 // Ordered start → thumbnails → end sequence backing the enlarged-preview prev/next navigation and filmstrip.
 const modalSequence = computed(() => {
   const list: { time: number; src: string; label: string }[] = []
-  if (showStartEndpoint.value && startThumbnail.value) list.push({ time: 0, src: startThumbnail.value, label: '起點' })
+  if (showStartEndpoint.value) list.push({ time: 0, src: startThumbnail.value || '', label: '起點' })
   for (const item of thumbnails.value) list.push({ time: item.time, src: item.base64, label: item.timeStr })
-  if (showEndEndpoint.value && endThumbnail.value) list.push({ time: videoDuration.value, src: endThumbnail.value, label: '終點' })
+  if (showEndEndpoint.value) list.push({ time: videoDuration.value, src: endThumbnail.value || '', label: '終點' })
   return list
 })
 const activeModalItem = computed(() => (activeModalIndex.value !== null ? (modalSequence.value[activeModalIndex.value] ?? null) : null))
@@ -731,7 +731,7 @@ function stopActiveThumbnail() {
   }
 }
 
-async function captureAtTimes(times: number[], offset: number, shouldStop?: () => boolean, onCaptured?: (item: ThumbnailItem) => void) {
+async function captureAtTimes(times: number[], offset: number, shouldStop?: () => boolean, onCaptured?: (item: ThumbnailItem, index: number) => void) {
   const result: ThumbnailItem[] = []
   for (let i = 0; i < times.length; i += 1) {
     if (shouldStop && shouldStop()) break
@@ -759,7 +759,7 @@ async function captureAtTimes(times: number[], offset: number, shouldStop?: () =
     }
     const item = { time: times[i], timeStr: formatSeconds(times[i]), base64: `data:image/jpeg;base64,${base64}` }
     result.push(item)
-    onCaptured?.(item)
+    onCaptured?.(item, i)
     progressPercent.value = Math.round(((i + 1) / times.length) * 100)
     progressText.value = `已完成擷取 ${i + 1}/${times.length} 張（${progressPercent.value}%）`
   }
@@ -795,9 +795,13 @@ async function generateGridThumbnails() {
     const times = Array.from({ length: actualCount }, (_, index) => initialCaptureMode.value === 'grid'
       ? ((index + 1) * duration) / (actualCount + 1)
       : (index + 1) * interval)
+    thumbnails.value = times.map((time) => ({ time, timeStr: formatSeconds(time), base64: '' }))
+    normaliseLayout()
     await captureAtTimes(times, 0, () => initialCaptureCancelRequested.value, (item) => {
-      thumbnails.value.push(item)
+      const target = thumbnails.value.find((thumbnail) => thumbnail.time === item.time)
+      if (target) target.base64 = item.base64
     })
+    thumbnails.value = thumbnails.value.filter((item) => item.base64)
     normaliseLayout()
     if (initialCaptureCancelRequested.value) {
       addLog(`已取消建立初始縮圖，已保留取消前完成的 ${thumbnails.value.length} 張縮圖。`)
@@ -806,6 +810,7 @@ async function generateGridThumbnails() {
       addLog(`已建立 ${thumbnails.value.length} 張中間縮圖，起點與終點將在背景擷取。`)
     }
   } catch (error) {
+    thumbnails.value = thumbnails.value.filter((item) => item.base64)
     addLog(`擷取失敗：${String(error)}`)
   } finally {
     isProcessing.value = false
@@ -969,6 +974,7 @@ async function restoreTaskForEditing(taskId: string) {
   showStartEndpoint.value = times.some((time) => time === 0)
   showEndEndpoint.value = times.some((time) => Math.abs(time - timeline.duration) <= 0.0005)
   const middleTimes = times.filter((time) => time > 0 && time < timeline.duration)
+  thumbnails.value = middleTimes.map((time) => ({ time, timeStr: formatSeconds(time), base64: '' }))
   normaliseLayout()
   activePanel.value = 'load'
   loadSubPanel.value = 'init'
@@ -978,13 +984,16 @@ async function restoreTaskForEditing(taskId: string) {
   let completed = false
   try {
     await captureAtTimes(middleTimes, 0, () => initialCaptureCancelRequested.value, (item) => {
-      thumbnails.value.push(item)
+      const target = thumbnails.value.find((thumbnail) => thumbnail.time === item.time)
+      if (target) target.base64 = item.base64
     })
+    thumbnails.value = thumbnails.value.filter((item) => item.base64)
     completed = !initialCaptureCancelRequested.value
     normaliseLayout()
     if (completed) addLog(`已恢復 ${thumbnails.value.length} 張中間縮圖，可繼續調整任務。`)
     else addLog(`已取消恢復縮圖，保留已完成的 ${thumbnails.value.length} 張。`)
   } catch (error) {
+    thumbnails.value = thumbnails.value.filter((item) => item.base64)
     addLog(`恢復任務縮圖失敗：${String(error)}`)
   } finally {
     isProcessing.value = false
@@ -1121,10 +1130,25 @@ async function runExpansionJob(job: ExpansionJob) {
     addLog(`擴充失敗（${job.label}）：${message}`)
     throw new Error(message)
   }
-  const additions = await captureAtTimes(times, thumbnails.value.length, () => job.cancelRequested, (item) => {
-    thumbnails.value.splice(indexForTime(job.anchorEndTime), 0, item)
-    normaliseLayout()
-  })
+  const insertAt = indexForTime(job.anchorEndTime)
+  const placeholders = times.map((time) => ({ time, timeStr: formatSeconds(time), base64: '' }))
+  thumbnails.value.splice(insertAt, 0, ...placeholders)
+  normaliseLayout()
+  let additions: ThumbnailItem[] = []
+  try {
+    additions = await captureAtTimes(times, thumbnails.value.length, () => job.cancelRequested, (item) => {
+      const target = thumbnails.value.find((thumbnail) => thumbnail.time === item.time)
+      if (target) target.base64 = item.base64
+    })
+  } catch (error) {
+    const timeSet = new Set(times)
+    thumbnails.value = thumbnails.value.filter((item) => item.base64 || !timeSet.has(item.time))
+    throw error
+  }
+  if (job.cancelRequested) {
+    const timeSet = new Set(times)
+    thumbnails.value = thumbnails.value.filter((item) => item.base64 || !timeSet.has(item.time))
+  }
   normaliseLayout()
   if (job.cancelRequested) {
     addLog(`已取消「${job.label}」，已插入取消前完成的 ${additions.length} 張縮圖。`)
@@ -1668,9 +1692,9 @@ function createCombineTask() {
                   locked: lockedTimeSet.has(item.time),
                 }"
                 @click="toggleSelection(item.time)"
-                @dblclick="item.src && openModalForTime(item.time)"
+                @dblclick="openModalForTime(item.time)"
               >
-                <div class="img-wrapper"><img v-if="item.src" :src="item.src" :alt="`縮圖 ${item.label}`" /><span v-if="item.endpoint" class="endpoint-label">{{ item.time === 0 ? '起點' : '終點' }}</span></div>
+                <div class="img-wrapper"><img v-if="item.src" :src="item.src" :alt="`縮圖 ${item.label}`" /><div v-else class="thumbnail-loading"><span></span><small>載入中</small></div><span v-if="item.endpoint" class="endpoint-label">{{ item.time === 0 ? '起點' : '終點' }}</span></div>
                 <div class="time-tag">{{ item.label }}</div>
               </div>
             </div>
@@ -1686,7 +1710,8 @@ function createCombineTask() {
         <div class="modal-content-scroller" :class="{ 'fit-mode': modalImageSize === 'fit' }">
           <div class="modal-time-label">{{ activeModalItem.label }}</div>
           <div class="modal-image-viewport">
-            <img :src="activeModalItem.src" class="original-size-img" alt="原始縮圖" />
+            <img v-if="activeModalItem.src" :src="activeModalItem.src" class="original-size-img" alt="原始縮圖" />
+            <div v-else class="modal-loading"><span></span><strong>縮圖載入中…</strong><small>完成後會自動顯示，不需要關閉視窗。</small></div>
           </div>
         </div>
         <button class="modal-nav-btn modal-nav-next" :disabled="activeModalIndex === modalSequence.length - 1" @click.stop="modalGoNext">›</button>
@@ -1706,7 +1731,8 @@ function createCombineTask() {
           :class="{ active: item.index === activeModalIndex }"
           @click="activeModalIndex = item.index"
         >
-          <img :src="item.src" :alt="item.label" />
+          <img v-if="item.src" :src="item.src" :alt="item.label" />
+          <div v-else class="filmstrip-loading"><span></span></div>
           <span class="filmstrip-time">{{ item.label }}</span>
         </div>
         <div class="filmstrip-spacer" :style="{ width: `${(modalSequence.length - filmstripLast) * filmstripPitch}px` }"></div>
@@ -2379,6 +2405,40 @@ select:focus {
   display: block;
   object-fit: cover;
 }
+.thumbnail-loading,
+.modal-loading,
+.filmstrip-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(110deg, #111827 25%, #1e293b 45%, #111827 65%);
+  background-size: 220% 100%;
+  animation: thumbnail-shimmer 1.4s ease-in-out infinite;
+  color: #94a3b8;
+}
+.thumbnail-loading {
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+}
+.thumbnail-loading span,
+.modal-loading span,
+.filmstrip-loading span {
+  width: 1.25rem;
+  height: 1.25rem;
+  border: 2px solid rgba(148, 163, 184, 0.35);
+  border-top-color: #a5b4fc;
+  border-radius: 50%;
+  animation: thumbnail-spin 0.8s linear infinite;
+}
+@keyframes thumbnail-shimmer {
+  to { background-position: -220% 0; }
+}
+@keyframes thumbnail-spin {
+  to { transform: rotate(360deg); }
+}
 .time-tag {
   height: 22px;
   box-sizing: border-box;
@@ -2588,6 +2648,16 @@ select:focus {
     monospace;
   margin-bottom: 0.6rem;
 }
+.modal-loading {
+  width: min(720px, 80vw);
+  min-height: min(420px, 60vh);
+  flex-direction: column;
+  gap: 0.8rem;
+  border-radius: 10px;
+}
+.modal-loading small {
+  color: #64748b;
+}
 .original-size-img {
   display: block;
   max-width: none;
@@ -2679,6 +2749,11 @@ select:focus {
   min-height: 0;
   object-fit: cover;
   display: block;
+}
+.filmstrip-loading {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
 }
 .filmstrip-time {
   font:

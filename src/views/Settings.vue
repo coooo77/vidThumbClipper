@@ -13,6 +13,8 @@ const notifyEnabled = ref(false)
 const notifyVolume = ref(70)
 const notifyTrigger = ref<NotifyTrigger>('batch')
 const notifyOnFailure = ref(true)
+const diskSafetyEnabled = ref(false)
+const diskSafetyMinGb = ref(100)
 
 onMounted(() => {
   ffmpegPath.value = localStorage.getItem('vid_ffmpeg_path') || ''
@@ -23,6 +25,8 @@ onMounted(() => {
   notifyVolume.value = notify.volume
   notifyTrigger.value = notify.trigger
   notifyOnFailure.value = notify.onFailure
+  diskSafetyEnabled.value = localStorage.getItem('vid_disk_safety_enabled') === 'true'
+  diskSafetyMinGb.value = Math.max(1, Number(localStorage.getItem('vid_disk_safety_min_gb')) || 100)
 })
 
 function showStatus(message: string) {
@@ -36,6 +40,8 @@ function saveSettings() {
   localStorage.setItem('vid_ffprobe_path', ffprobePath.value.trim())
   localStorage.setItem('vid_task_suffix', taskNameSuffix.value.trim() || '_edit')
   saveNotifySettings({ enabled: notifyEnabled.value, volume: notifyVolume.value, trigger: notifyTrigger.value, onFailure: notifyOnFailure.value })
+  localStorage.setItem('vid_disk_safety_enabled', String(diskSafetyEnabled.value))
+  localStorage.setItem('vid_disk_safety_min_gb', String(Math.max(1, Number(diskSafetyMinGb.value) || 100)))
   showStatus('設定已儲存。')
 }
 function testCompletionSound() {
@@ -107,6 +113,19 @@ async function clearThumbnailCache() {
         ><transition name="fade"
           ><span v-if="statusMsg" class="status-badge">{{ statusMsg }}</span></transition
         >
+      </div>
+    </section>
+
+    <section class="card settings-card">
+      <h2 class="card-title">硬碟容量安全保護</h2>
+      <p class="description">啟用後，每個任務開始前都會檢查該任務實際輸出磁碟的可用空間。低於門檻時會保留任務並停止整批處理，避免輸出到一半耗盡空間。</p>
+      <label class="checkbox-row-label"><input type="checkbox" v-model="diskSafetyEnabled" @change="saveSettings" /> 啟用容量安全保護</label>
+      <div v-if="diskSafetyEnabled" class="disk-safety-settings">
+        <div class="input-group">
+          <label>最低可用空間（GB）</label>
+          <input v-model.number="diskSafetyMinGb" type="number" min="1" step="1" @change="saveSettings" />
+          <p class="field-hint">預設 100 GB。可用空間等於或高於此值時才會開始任務。</p>
+        </div>
       </div>
     </section>
 
@@ -195,6 +214,10 @@ async function clearThumbnailCache() {
   gap: 1.25rem;
   margin-top: 0.25rem;
   padding: 1rem 1.1rem;
+  border-left: 2px solid var(--border-color);
+}
+.disk-safety-settings {
+  padding: 1rem 1.1rem 0;
   border-left: 2px solid var(--border-color);
 }
 .notify-sub-settings .mode-row {

@@ -225,6 +225,79 @@ fn get_file_size(path: String) -> Result<u64, String> {
         .map_err(|error| format!("Unable to read file size: {error}"))
 }
 
+#[cfg(target_os = "windows")]
+fn available_space_for_path(path: &str) -> Result<u64, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory_name: *const u16,
+            free_bytes_available: *mut u64,
+            total_number_of_bytes: *mut u64,
+            total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+
+    let wide_path: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available = 0_u64;
+    let success = unsafe {
+        GetDiskFreeSpaceExW(
+            wide_path.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        Err(format!(
+            "Unable to read available disk space for '{}': {}",
+            path,
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(available)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn available_space_for_path(path: &str) -> Result<u64, String> {
+    let output = Command::new("df")
+        .args(["-Pk", path])
+        .output()
+        .map_err(|error| format!("Unable to run df: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Unable to read available disk space: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .last()
+        .ok_or("Unable to parse disk space result")?
+        .to_string();
+    let available_kib = line
+        .split_whitespace()
+        .nth(3)
+        .ok_or("Unable to parse available disk space")?
+        .parse::<u64>()
+        .map_err(|error| format!("Unable to parse available disk space: {error}"))?;
+    Ok(available_kib * 1024)
+}
+
+#[tauri::command]
+fn get_available_space(path: String) -> Result<u64, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Unable to read disk space: path is empty".to_string());
+    }
+    available_space_for_path(trimmed)
+}
+
 #[tauri::command]
 async fn run_ffmpeg(
     ffmpeg_path: Option<String>,
@@ -596,6 +669,7 @@ pub fn run() {
             clear_thumbnail_cache,
             delete_file,
             get_file_size,
+            get_available_space,
             concat_videos,
             cancel_current_task
         ])

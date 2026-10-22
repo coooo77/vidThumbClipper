@@ -14,6 +14,7 @@ const showStopConfirm = ref(false)
 const pendingCancelTaskId = ref<string | null>(null)
 const pendingEditTaskId = ref<string | null>(null)
 const expandedTaskIds = ref<string[]>([])
+const safetyWarning = ref('')
 const hasPendingTasks = computed(() => videoTasks.some((task) => task.status === '等待中'))
 const router = useRouter()
 
@@ -33,6 +34,26 @@ function resolveOutputFolder(task: VideoTask) {
 }
 function destination(task: VideoTask, suffix = '') {
   return `${resolveOutputFolder(task)}${task.outputName}${suffix}.${task.extension.replace(/^\./, '')}`
+}
+function diskSafetySettings() {
+  return {
+    enabled: localStorage.getItem('vid_disk_safety_enabled') === 'true',
+    minGb: Math.max(1, Number(localStorage.getItem('vid_disk_safety_min_gb')) || 100),
+  }
+}
+async function ensureEnoughDiskSpace(task: VideoTask) {
+  const settings = diskSafetySettings()
+  if (!settings.enabled) return true
+  const folder = resolveOutputFolder(task).replace(/[\\/]$/, '')
+  try {
+    const availableBytes = await invoke<number>('get_available_space', { path: folder })
+    const availableGb = availableBytes / 1024 ** 3
+    if (availableGb >= settings.minGb) return true
+    safetyWarning.value = `已停止執行：輸出磁碟僅剩 ${availableGb.toFixed(1)} GB，低於安全門檻 ${settings.minGb} GB。請釋放空間、調整輸出位置，或到設定變更門檻。`
+  } catch (error) {
+    safetyWarning.value = `無法確認輸出磁碟容量，因此未開始任務：${String(error)}`
+  }
+  return false
 }
 function parseExtraArgs(value: string) {
   return value.trim() ? value.trim().split(/\s+/) : []
@@ -248,6 +269,7 @@ async function runTasks() {
   if (running.value) return
   if (outputDirectory.value.trim()) localStorage.setItem('vid_output_directory', outputDirectory.value.trim())
   running.value = true
+  safetyWarning.value = ''
   const { trigger } = getNotifySettings()
   let processedAny = false
   let hadFailure = false
@@ -255,6 +277,7 @@ async function runTasks() {
     for (;;) {
       const task = videoTasks.find((item) => item.status === '等待中')
       if (!task) break
+      if (!(await ensureEnoughDiskSpace(task))) break
       processedAny = true
       task.status = '處理中'
       try {
@@ -304,6 +327,7 @@ async function runTasks() {
         </div>
       </div>
       <p class="info">任務會依建立順序執行。原始影片只會被讀取，絕不覆寫。</p>
+      <div v-if="safetyWarning" class="safety-warning">{{ safetyWarning }}</div>
       <div class="input-group">
         <label>輸出位置（留空則輸出到原始影片所在資料夾）</label>
         <div class="input-with-btn">
@@ -401,6 +425,16 @@ async function runTasks() {
   font-size: 0.9rem;
   line-height: 1.5;
   margin: 0 0 1.1rem;
+}
+.safety-warning {
+  margin: 0 0 1rem;
+  padding: 0.8rem 1rem;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-radius: 9px;
+  background: rgba(120, 53, 15, 0.22);
+  color: #fcd34d;
+  font-size: 0.86rem;
+  line-height: 1.5;
 }
 .task-row {
   display: flex;

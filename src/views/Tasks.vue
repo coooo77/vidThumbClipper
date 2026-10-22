@@ -18,6 +18,12 @@ const expandedTaskIds = ref<string[]>([])
 const draggedTaskId = ref<string | null>(null)
 const dragTargetTaskId = ref<string | null>(null)
 const dragTargetAfter = ref(false)
+let pointerDragSourceId: string | null = null
+let pointerDragStartX = 0
+let pointerDragStartY = 0
+let pointerDragActive = false
+let pointerDragHandle: HTMLElement | null = null
+let pointerDragId: number | null = null
 const safetyWarning = ref('')
 const clockNow = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | null = null
@@ -45,10 +51,19 @@ onMounted(() => {
   scheduledMinute.value = suggestedTime.getMinutes()
   scheduledSecond.value = 0
   startScheduleTimer()
+  window.addEventListener('pointermove', onTaskPointerMove, { passive: false })
+  window.addEventListener('pointerup', onTaskPointerUp)
+  window.addEventListener('pointercancel', finishTaskDrag)
+  window.addEventListener('blur', finishTaskDrag)
 })
 onUnmounted(() => {
   if (clockTimer) clearInterval(clockTimer)
   if (scheduleTimer) clearInterval(scheduleTimer)
+  window.removeEventListener('pointermove', onTaskPointerMove)
+  window.removeEventListener('pointerup', onTaskPointerUp)
+  window.removeEventListener('pointercancel', finishTaskDrag)
+  window.removeEventListener('blur', finishTaskDrag)
+  finishTaskDrag()
 })
 function resolveOutputFolder(task: VideoTask) {
   return resolveTaskOutputFolder(task, outputDirectory.value)
@@ -204,41 +219,73 @@ function canDragTask(task: VideoTask) {
   return !running.value && task.status === '等待中'
 }
 
-function onTaskDragStart(event: DragEvent, task: VideoTask) {
-  if (!canDragTask(task)) return event.preventDefault()
-  draggedTaskId.value = task.id
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.setData('text/plain', task.id)
-  }
-}
-
-function onTaskDragOver(event: DragEvent, task: VideoTask) {
-  if (!draggedTaskId.value || draggedTaskId.value === task.id || !canDragTask(task)) return
-  event.preventDefault()
-  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
-  const row = event.currentTarget as HTMLElement
-  dragTargetTaskId.value = task.id
-  dragTargetAfter.value = event.clientY >= row.getBoundingClientRect().top + row.offsetHeight / 2
-}
-
-function onTaskDrop(event: DragEvent, task: VideoTask) {
-  event.preventDefault()
-  const sourceIndex = videoTasks.findIndex((item) => item.id === draggedTaskId.value)
-  const targetIndex = videoTasks.findIndex((item) => item.id === task.id)
-  if (sourceIndex !== -1 && targetIndex !== -1 && sourceIndex !== targetIndex && canDragTask(task)) {
-    let insertAt = targetIndex + (dragTargetAfter.value ? 1 : 0)
+function reorderTaskRelative(sourceId: string, targetId: string, insertAfter: boolean) {
+  const sourceIndex = videoTasks.findIndex((item) => item.id === sourceId)
+  const targetIndex = videoTasks.findIndex((item) => item.id === targetId)
+  const targetTask = videoTasks[targetIndex]
+  if (sourceIndex !== -1 && targetIndex !== -1 && sourceIndex !== targetIndex && targetTask && canDragTask(targetTask)) {
+    let insertAt = targetIndex + (insertAfter ? 1 : 0)
     const [moved] = videoTasks.splice(sourceIndex, 1)
     if (sourceIndex < insertAt) insertAt -= 1
     videoTasks.splice(insertAt, 0, moved)
+  }
+}
+
+function onTaskPointerDown(event: PointerEvent, task: VideoTask) {
+  if (event.button !== 0 || !canDragTask(task)) return
+  pointerDragSourceId = task.id
+  pointerDragStartX = event.clientX
+  pointerDragStartY = event.clientY
+  pointerDragActive = false
+  pointerDragHandle = event.currentTarget as HTMLElement
+  pointerDragId = event.pointerId
+  pointerDragHandle.setPointerCapture?.(event.pointerId)
+  event.preventDefault()
+}
+
+function onTaskPointerMove(event: PointerEvent) {
+  if (!pointerDragSourceId) return
+  if (!pointerDragActive && Math.hypot(event.clientX - pointerDragStartX, event.clientY - pointerDragStartY) < 5) return
+  if (!pointerDragActive) {
+    pointerDragActive = true
+    draggedTaskId.value = pointerDragSourceId
+    document.body.classList.add('task-reordering')
+  }
+  event.preventDefault()
+  const row = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-task-id]')
+  const targetId = row?.dataset.taskId || null
+  const targetTask = videoTasks.find((task) => task.id === targetId)
+  if (!row || !targetTask || targetId === pointerDragSourceId || !canDragTask(targetTask)) {
+    dragTargetTaskId.value = null
+    return
+  }
+  const bounds = row.getBoundingClientRect()
+  dragTargetTaskId.value = targetId
+  dragTargetAfter.value = event.clientY >= bounds.top + bounds.height / 2
+  const edge = 56
+  if (event.clientY < edge) window.scrollBy({ top: -12 })
+  else if (event.clientY > window.innerHeight - edge) window.scrollBy({ top: 12 })
+}
+
+function onTaskPointerUp() {
+  if (pointerDragActive && pointerDragSourceId && dragTargetTaskId.value) {
+    reorderTaskRelative(pointerDragSourceId, dragTargetTaskId.value, dragTargetAfter.value)
   }
   finishTaskDrag()
 }
 
 function finishTaskDrag() {
+  if (pointerDragHandle && pointerDragId !== null && pointerDragHandle.hasPointerCapture?.(pointerDragId)) {
+    pointerDragHandle.releasePointerCapture(pointerDragId)
+  }
+  pointerDragSourceId = null
+  pointerDragActive = false
+  pointerDragHandle = null
+  pointerDragId = null
   draggedTaskId.value = null
   dragTargetTaskId.value = null
   dragTargetAfter.value = false
+  document.body.classList.remove('task-reordering')
 }
 
 function toggleTaskRanges(taskId: string) {
@@ -512,13 +559,12 @@ async function runTasks() {
         v-for="(task, index) in videoTasks"
         :key="task.id"
         class="task-row"
+        :data-task-id="task.id"
         :class="{
           'task-dragging': draggedTaskId === task.id,
           'task-drag-before': dragTargetTaskId === task.id && !dragTargetAfter,
           'task-drag-after': dragTargetTaskId === task.id && dragTargetAfter,
         }"
-        @dragover="onTaskDragOver($event, task)"
-        @drop="onTaskDrop($event, task)"
       >
         <div class="task-content w-full">
           <div class="task-header">
@@ -530,7 +576,7 @@ async function runTasks() {
             </div>
             <div class="task-row-actions">
               <div v-if="task.status === '等待中'" class="task-order-controls" aria-label="調整任務順序">
-                <button class="task-order-button task-drag-handle" :draggable="canDragTask(task)" :disabled="running" title="拖曳調整順序" aria-label="拖曳調整任務順序" @dragstart="onTaskDragStart($event, task)" @dragend="finishTaskDrag">⠿</button>
+                <button class="task-order-button task-drag-handle" :disabled="running" title="按住並拖曳以調整順序" aria-label="拖曳調整任務順序" @pointerdown="onTaskPointerDown($event, task)">⠿</button>
                 <button class="task-order-button" :disabled="!canMoveTask(index, -1)" title="向上移動" aria-label="向上移動任務" @click="moveTask(index, -1)">↑</button>
                 <button class="task-order-button" :disabled="!canMoveTask(index, 1)" title="向下移動" aria-label="向下移動任務" @click="moveTask(index, 1)">↓</button>
               </div>
@@ -801,9 +847,16 @@ async function runTasks() {
 .task-drag-handle:not(:disabled) {
   cursor: grab;
   font-size: 1rem;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-drag: none;
 }
 .task-drag-handle:not(:disabled):active {
   cursor: grabbing;
+}
+:global(body.task-reordering) {
+  cursor: grabbing;
+  user-select: none;
 }
 .task-control {
   display: inline-flex;

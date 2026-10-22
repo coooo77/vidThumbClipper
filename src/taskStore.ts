@@ -14,6 +14,12 @@ export interface TaskPreviewTimeline {
   times: number[]
   gridCols: number
 }
+export interface TaskProgress {
+  completed: number
+  total: number
+  startedAt: number
+  label: string
+}
 export interface VideoTask {
   id: string
   kind: TaskKind
@@ -36,6 +42,7 @@ export interface VideoTask {
   // Only timeline metadata is persisted. Thumbnail image data is intentionally excluded so even
   // very large previews do not consume hundreds of megabytes on disk.
   previewTimeline?: TaskPreviewTimeline
+  progress?: TaskProgress
 }
 
 const storageKey = 'vid_thumb_clipper_tasks'

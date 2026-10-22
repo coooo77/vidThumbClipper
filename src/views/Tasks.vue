@@ -15,6 +15,8 @@ const pendingCancelTaskId = ref<string | null>(null)
 const pendingEditTaskId = ref<string | null>(null)
 const expandedTaskIds = ref<string[]>([])
 const safetyWarning = ref('')
+const clockNow = ref(Date.now())
+let clockTimer: ReturnType<typeof setInterval> | null = null
 const hasPendingTasks = computed(() => videoTasks.some((task) => task.status === '等待中'))
 const router = useRouter()
 
@@ -66,6 +68,40 @@ function formatTime(seconds: number) {
     .join(':')
   const milliseconds = totalMs % 1000
   return milliseconds ? `${base}.${String(milliseconds).padStart(3, '0')}` : base
+}
+function formatDuration(seconds: number) {
+  const rounded = Math.max(0, Math.round(seconds))
+  const hours = Math.floor(rounded / 3600)
+  const minutes = Math.floor((rounded % 3600) / 60)
+  const remainingSeconds = rounded % 60
+  if (hours) return `${hours} 小時 ${minutes} 分`
+  if (minutes) return `${minutes} 分 ${remainingSeconds} 秒`
+  return `${remainingSeconds} 秒`
+}
+function startTaskProgress(task: VideoTask, total: number, label: string) {
+  task.progress = { completed: 0, total: Math.max(1, total), startedAt: Date.now(), label }
+}
+function completeTaskStep(task: VideoTask, label: string) {
+  if (!task.progress) return
+  task.progress.completed = Math.min(task.progress.total, task.progress.completed + 1)
+  task.progress.label = label
+}
+function taskProgressPercent(task: VideoTask) {
+  if (!task.progress?.total) return 0
+  return Math.round((task.progress.completed / task.progress.total) * 100)
+}
+function taskElapsedSeconds(task: VideoTask) {
+  if (!task.progress?.startedAt) return 0
+  const end = task.status === '處理中' ? clockNow.value : task.progress.startedAt + Math.max(0, task.progress.completed ? 1 : 0)
+  return Math.max(0, (end - task.progress.startedAt) / 1000)
+}
+function taskEtaText(task: VideoTask) {
+  const progress = task.progress
+  if (!progress || task.status !== '處理中') return ''
+  if (!progress.completed) return '剩餘時間估算中'
+  const elapsed = (clockNow.value - progress.startedAt) / 1000
+  const remaining = (elapsed / progress.completed) * (progress.total - progress.completed)
+  return remaining > 0 ? `預估剩餘 ${formatDuration(remaining)}` : '即將完成'
 }
 
 function taskSummary(task: VideoTask) {
@@ -200,8 +236,10 @@ async function clipRange(task: VideoTask, range: VideoSegment, path: string) {
   }
 }
 async function runPreprocessTask(task: VideoTask) {
+  startTaskProgress(task, 1, '正在預先處理')
   const path = destination(task)
   await invoke('run_ffmpeg', { ffmpegPath: ffmpegPath.value || null, args: ['-i', task.source, '-c', 'copy', path, '-y'] })
+  completeTaskStep(task, '預先處理完成')
   task.resultPath = path
 }
 async function runClipTask(task: VideoTask) {
@@ -222,16 +260,25 @@ async function runClipTask(task: VideoTask) {
             start: (duration * index) / task.splitCount,
             end: (duration * (index + 1)) / task.splitCount,
           }))
+  startTaskProgress(task, ranges.length, `準備剪輯 ${ranges.length} 個片段`)
   for (let index = 0; index < ranges.length; index += 1)
-    await clipRange(task, ranges[index], destination(task, ranges.length > 1 ? `_${String(index + 1).padStart(3, '0')}` : ''))
+    {
+      if (task.progress) task.progress.label = `正在剪輯片段 ${index + 1}/${ranges.length}`
+      await clipRange(task, ranges[index], destination(task, ranges.length > 1 ? `_${String(index + 1).padStart(3, '0')}` : ''))
+      completeTaskStep(task, `已完成片段 ${index + 1}/${ranges.length}`)
+    }
 }
 async function runMergeTask(task: VideoTask) {
+  startTaskProgress(task, task.segments.length + 1, `準備剪輯 ${task.segments.length} 個片段`)
   const clips: string[] = []
   for (let index = 0; index < task.segments.length; index += 1) {
+    if (task.progress) task.progress.label = `正在剪輯片段 ${index + 1}/${task.segments.length}`
     const path = destination(task, `_segment_${String(index + 1).padStart(3, '0')}`)
     await clipRange(task, task.segments[index], path)
     clips.push(path)
+    completeTaskStep(task, `已完成片段 ${index + 1}/${task.segments.length}`)
   }
+  if (task.progress) task.progress.label = '正在合併片段'
   await invoke('concat_videos', {
     ffmpegPath: ffmpegPath.value || null,
     files: clips,
@@ -239,8 +286,10 @@ async function runMergeTask(task: VideoTask) {
     extraArgs: parseExtraArgs(task.extraArgs),
     deleteInputs: !task.keepSegments,
   })
+  completeTaskStep(task, '合併完成')
 }
 async function runCombineTask(task: VideoTask) {
+  startTaskProgress(task, 1, '正在合併影片')
   const path = destination(task)
   if (task.combineMode === 'copy') {
     await invoke('concat_videos', { ffmpegPath: ffmpegPath.value || null, files: task.combineSources, outputPath: path, extraArgs: [], deleteInputs: false })
@@ -264,11 +313,13 @@ async function runCombineTask(task: VideoTask) {
     )
   }
   task.resultPath = path
+  completeTaskStep(task, '合併完成')
 }
 async function runTasks() {
   if (running.value) return
   if (outputDirectory.value.trim()) localStorage.setItem('vid_output_directory', outputDirectory.value.trim())
   running.value = true
+  clockTimer = setInterval(() => { clockNow.value = Date.now() }, 1000)
   safetyWarning.value = ''
   const { trigger } = getNotifySettings()
   let processedAny = false
@@ -303,6 +354,8 @@ async function runTasks() {
     }
   } finally {
     running.value = false
+    if (clockTimer) clearInterval(clockTimer)
+    clockTimer = null
     if (trigger === 'batch' && processedAny) notifyResult(!hadFailure)
   }
 }
@@ -389,6 +442,16 @@ async function runTasks() {
             <p v-else class="range-empty">這筆舊任務沒有保存可展開的實際範圍，執行時會依影片長度計算。</p>
           </div>
           <p class="task-file-name truncate w-full" :title="`${task.outputName}.${task.extension}`">{{ task.outputName }}.{{ task.extension }}</p>
+          <div v-if="task.progress" class="task-progress">
+            <div class="task-progress-meta">
+              <span>{{ task.progress.label }}</span>
+              <span v-if="task.status === '處理中'">{{ taskProgressPercent(task) }}% · 已執行 {{ formatDuration(taskElapsedSeconds(task)) }} · {{ taskEtaText(task) }}</span>
+              <span v-else-if="task.status === '完成'">100%</span>
+            </div>
+            <div class="task-progress-track" :class="{ indeterminate: task.status === '處理中' && task.progress.completed === 0 }">
+              <span :style="{ width: `${taskProgressPercent(task)}%` }"></span>
+            </div>
+          </div>
           <div class="task-output-dir">
             <label>輸出位置</label>
             <input class="w-full" v-model="task.outputDir" :disabled="task.status !== '等待中'" :placeholder="`預設：${outputDirectory || '原始影片所在資料夾'}`" />
@@ -598,6 +661,39 @@ async function runTasks() {
 }
 .task-file-name {
   margin-top: 0 !important;
+}
+.task-progress {
+  margin: 0.65rem 0 0.2rem;
+}
+.task-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+.task-progress-track {
+  position: relative;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+}
+.task-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #6366f1, #22c55e);
+  transition: width 0.3s ease;
+}
+.task-progress-track.indeterminate span {
+  width: 35% !important;
+  animation: task-progress-slide 1.4s ease-in-out infinite;
+}
+@keyframes task-progress-slide {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(310%); }
 }
 .task-row .message {
   margin-top: 0.55rem;

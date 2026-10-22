@@ -18,10 +18,14 @@ const expandedTaskIds = ref<string[]>([])
 const safetyWarning = ref('')
 const clockNow = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | null = null
-const scheduleMode = ref<'now' | 'delay' | 'datetime'>('now')
+const scheduleMode = ref<'now' | 'delay' | 'clock'>('now')
 const delayHours = ref(0)
 const delayMinutes = ref(30)
-const scheduledDateTime = ref('')
+const scheduledHour = ref(6)
+const scheduledMinute = ref(30)
+const scheduledSecond = ref(0)
+const hourOptions = Array.from({ length: 24 }, (_, index) => index)
+const minuteSecondOptions = Array.from({ length: 60 }, (_, index) => index)
 const scheduledStartAt = ref<number | null>(null)
 const scheduledNow = ref(Date.now())
 let scheduleTimer: ReturnType<typeof setInterval> | null = null
@@ -33,7 +37,10 @@ onMounted(() => {
   ffprobePath.value = localStorage.getItem('vid_ffprobe_path') || ''
   const storedSchedule = Number(localStorage.getItem('vid_task_schedule_at'))
   scheduledStartAt.value = Number.isFinite(storedSchedule) && storedSchedule > 0 ? storedSchedule : null
-  scheduledDateTime.value = toLocalDateTimeInput(Date.now() + 60 * 60 * 1000)
+  const suggestedTime = new Date(Date.now() + 60 * 60 * 1000)
+  scheduledHour.value = suggestedTime.getHours()
+  scheduledMinute.value = suggestedTime.getMinutes()
+  scheduledSecond.value = 0
   startScheduleTimer()
 })
 onUnmounted(() => {
@@ -78,10 +85,14 @@ function formatDuration(seconds: number) {
   if (minutes) return `${minutes} 分 ${remainingSeconds} 秒`
   return `${remainingSeconds} 秒`
 }
-function toLocalDateTimeInput(timestamp: number) {
-  const date = new Date(timestamp)
-  const pad = (value: number) => String(value).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+function nextClockStartAt() {
+  const start = new Date()
+  start.setHours(scheduledHour.value, scheduledMinute.value, scheduledSecond.value, 0)
+  if (start.getTime() <= Date.now()) start.setDate(start.getDate() + 1)
+  return start.getTime()
+}
+function scheduledClockPreview() {
+  return new Date(nextClockStartAt()).toLocaleString()
 }
 function scheduleCountdownText() {
   if (!scheduledStartAt.value) return ''
@@ -121,11 +132,7 @@ function requestTaskRun() {
     }
     startAt = Date.now() + delayMs
   } else {
-    startAt = new Date(scheduledDateTime.value).getTime()
-    if (!Number.isFinite(startAt) || startAt <= Date.now()) {
-      safetyWarning.value = '指定時間必須晚於現在，並可精確到秒。'
-      return
-    }
+    startAt = nextClockStartAt()
   }
   safetyWarning.value = ''
   scheduledStartAt.value = startAt
@@ -409,14 +416,21 @@ async function runTasks() {
         <div class="schedule-modes">
           <label><input v-model="scheduleMode" type="radio" value="now" :disabled="Boolean(scheduledStartAt)" /> 立即執行</label>
           <label><input v-model="scheduleMode" type="radio" value="delay" :disabled="Boolean(scheduledStartAt)" /> 延後執行</label>
-          <label><input v-model="scheduleMode" type="radio" value="datetime" :disabled="Boolean(scheduledStartAt)" /> 指定日期時間</label>
+          <label><input v-model="scheduleMode" type="radio" value="clock" :disabled="Boolean(scheduledStartAt)" /> 指定時間</label>
         </div>
         <div v-if="!scheduledStartAt && scheduleMode === 'delay'" class="schedule-fields">
           <label>小時 <input v-model.number="delayHours" type="number" min="0" step="1" /></label>
           <label>分鐘 <input v-model.number="delayMinutes" type="number" min="0" step="1" /></label>
         </div>
-        <div v-else-if="!scheduledStartAt && scheduleMode === 'datetime'" class="schedule-fields">
-          <label>開始時間 <input v-model="scheduledDateTime" type="datetime-local" step="1" /></label>
+        <div v-else-if="!scheduledStartAt && scheduleMode === 'clock'" class="schedule-clock-wrap">
+          <div class="schedule-fields clock-fields">
+            <label>時 <select v-model.number="scheduledHour"><option v-for="hour in hourOptions" :key="hour" :value="hour">{{ String(hour).padStart(2, '0') }}</option></select></label>
+            <span>:</span>
+            <label>分 <select v-model.number="scheduledMinute"><option v-for="minute in minuteSecondOptions" :key="minute" :value="minute">{{ String(minute).padStart(2, '0') }}</option></select></label>
+            <span>:</span>
+            <label>秒 <select v-model.number="scheduledSecond"><option v-for="second in minuteSecondOptions" :key="second" :value="second">{{ String(second).padStart(2, '0') }}</option></select></label>
+          </div>
+          <small>將安排在 {{ scheduledClockPreview() }}；若今天的時間已過，會自動改為明天。</small>
         </div>
         <div v-if="scheduledStartAt" class="scheduled-summary"><strong>已排程</strong><span>{{ scheduleCountdownText() }}</span><small>程式需保持開啟；若電腦休眠，喚醒後會立即補執行。</small></div>
       </div>
@@ -567,6 +581,25 @@ async function runTasks() {
   width: auto;
   min-width: 5.5rem;
   padding: 0.45rem 0.6rem;
+}
+.schedule-clock-wrap {
+  margin-top: 0.75rem;
+}
+.schedule-clock-wrap .schedule-fields {
+  margin-top: 0;
+}
+.clock-fields select {
+  min-width: 4.4rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.75);
+  color: var(--text-color);
+}
+.schedule-clock-wrap small {
+  display: block;
+  margin-top: 0.55rem;
+  color: var(--text-muted);
 }
 .scheduled-summary {
   display: flex;

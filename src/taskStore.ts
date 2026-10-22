@@ -65,7 +65,14 @@ function deduplicatePreprocessTasks(tasks: VideoTask[]) {
 let initialTasks: VideoTask[] = []
 try {
   const storedTasks = JSON.parse(localStorage.getItem(storageKey) || '[]') as VideoTask[]
-  initialTasks = deduplicatePreprocessTasks(storedTasks)
+  initialTasks = deduplicatePreprocessTasks(storedTasks).map((task) => task.status === '處理中'
+    ? {
+        ...task,
+        status: '等待中',
+        message: '上次程式關閉時此任務仍在處理，已安全移回等待佇列，請確認輸出檔案後再重新執行。',
+        progress: undefined,
+      }
+    : task)
 } catch {
   initialTasks = []
 }

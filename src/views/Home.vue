@@ -17,6 +17,7 @@ import {
   type VideoSegment,
   type VideoTask,
 } from '../taskStore'
+import { clearWorkspaceDraft, loadWorkspaceDraft, saveWorkspaceDraft } from '../workspaceStore'
 
 interface ThumbnailItem {
   time: number
@@ -57,6 +58,9 @@ const filmstripVisible = ref(true)
 const logs = ref<string[]>([])
 const progressText = ref('')
 const progressPercent = ref(0)
+const workspaceRecovered = ref(false)
+let workspaceReady = false
+let workspaceSaveTimer: ReturnType<typeof setTimeout> | null = null
 
 // The visible layout is always editable. Rows are increased automatically when more images are inserted.
 const gridCols = ref(7)
@@ -311,6 +315,122 @@ function loadPaths() {
   taskNameSuffix.value = localStorage.getItem('vid_task_suffix') || '_edit'
 }
 
+function restoreSavedWorkspace() {
+  const draft = loadWorkspaceDraft()
+  if (!draft?.videoPath) return
+  videoPath.value = draft.videoPath
+  originalSourcePath.value = draft.originalSourcePath || draft.videoPath
+  videoDuration.value = Math.max(0, Number(draft.videoDuration) || 0)
+  gridCols.value = Math.max(1, Math.floor(Number(draft.gridCols) || 1))
+  gridRows.value = Math.max(1, Math.floor(Number(draft.gridRows) || 1))
+  initialCaptureMode.value = draft.initialCaptureMode === 'interval' ? 'interval' : 'grid'
+  initialInterval.value = Math.max(0.1, Number(draft.initialInterval) || 4)
+  taskKind.value = draft.taskKind === 'merge' ? 'merge' : 'clip'
+  taskMethod.value = ['range', 'duration', 'count'].includes(draft.taskMethod) ? draft.taskMethod : 'range'
+  taskDurationHours.value = Math.max(0.1, Number(draft.taskDurationHours) || 6)
+  taskSplitCount.value = Math.max(2, Math.floor(Number(draft.taskSplitCount) || 5))
+  taskOutputName.value = draft.taskOutputName || `${baseNameWithoutExt(draft.videoPath)}${taskNameSuffix.value}`
+  taskOutputNameAuto.value = !draft.taskOutputName
+  taskExtension.value = draft.taskExtension || 'mp4'
+  taskExtraArgs.value = draft.taskExtraArgs || ''
+  taskPreciseSeek.value = draft.taskPreciseSeek !== false
+  taskKeepSegments.value = Boolean(draft.taskKeepSegments)
+  mergeSegments.value = Array.isArray(draft.mergeSegments) ? draft.mergeSegments.map((segment) => ({ ...segment })) : []
+  selectedTimes.value = Array.isArray(draft.selectedTimes) ? draft.selectedTimes.slice(0, 2) : []
+
+  const times = [...new Set((draft.previewTimes || []).filter((time) => Number.isFinite(time) && time >= 0))].sort((a, b) => a - b)
+  showStartEndpoint.value = times.some((time) => time === 0)
+  showEndEndpoint.value = videoDuration.value > 0 && times.some((time) => Math.abs(time - videoDuration.value) <= 0.0005)
+  thumbnails.value = times
+    .filter((time) => time > 0 && time < videoDuration.value)
+    .map((time) => ({ time, timeStr: formatSeconds(time), base64: '' }))
+  workspaceRecovered.value = times.length > 0
+  normaliseLayout()
+  addLog(workspaceRecovered.value ? '已復原上次工作區；縮圖圖片尚未載入，可自行選擇何時重新建立。' : '已復原上次工作區設定。')
+}
+
+function scheduleWorkspaceSave() {
+  if (!workspaceReady) return
+  if (workspaceSaveTimer) clearTimeout(workspaceSaveTimer)
+  workspaceSaveTimer = setTimeout(() => {
+    const previewTimes = [
+      ...(showStartEndpoint.value ? [0] : []),
+      ...thumbnails.value.map((item) => item.time),
+      ...(showEndEndpoint.value && videoDuration.value > 0 ? [videoDuration.value] : []),
+    ]
+    saveWorkspaceDraft({
+      videoPath: videoPath.value,
+      originalSourcePath: originalSourcePath.value,
+      videoDuration: videoDuration.value,
+      previewTimes,
+      selectedTimes: [...selectedTimes.value],
+      mergeSegments: mergeSegments.value.map((segment) => ({ ...segment })),
+      gridCols: gridCols.value,
+      gridRows: gridRows.value,
+      initialCaptureMode: initialCaptureMode.value,
+      initialInterval: initialInterval.value,
+      taskKind: taskKind.value,
+      taskMethod: taskMethod.value,
+      taskDurationHours: taskDurationHours.value,
+      taskSplitCount: taskSplitCount.value,
+      taskOutputName: taskOutputName.value,
+      taskExtension: taskExtension.value,
+      taskExtraArgs: taskExtraArgs.value,
+      taskPreciseSeek: taskPreciseSeek.value,
+      taskKeepSegments: taskKeepSegments.value,
+    })
+  }, 500)
+}
+
+watch([
+  videoPath, originalSourcePath, videoDuration, gridCols, gridRows, initialCaptureMode, initialInterval,
+  taskKind, taskMethod, taskDurationHours, taskSplitCount, taskOutputName, taskExtension, taskExtraArgs,
+  taskPreciseSeek, taskKeepSegments, showStartEndpoint, showEndEndpoint,
+  () => thumbnails.value.map((item) => item.time).join(','),
+  () => selectedTimes.value.join(','),
+  () => JSON.stringify(mergeSegments.value),
+], scheduleWorkspaceSave)
+
+async function reloadRecoveredWorkspaceThumbnails() {
+  if (!workspaceRecovered.value || isProcessing.value) return
+  const middleTimes = thumbnails.value.map((item) => item.time)
+  isProcessing.value = true
+  initialCaptureCancelRequested.value = false
+  try {
+    await captureAtTimes(middleTimes, 0, () => initialCaptureCancelRequested.value, (item) => {
+      const target = thumbnails.value.find((thumbnail) => thumbnail.time === item.time)
+      if (target) target.base64 = item.base64
+    })
+    thumbnails.value = thumbnails.value.filter((item) => item.base64)
+    if (!initialCaptureCancelRequested.value) {
+      workspaceRecovered.value = false
+      void captureEndpointThumbnails(videoDuration.value)
+      addLog('工作區縮圖已重新載入。')
+    }
+  } catch (error) {
+    thumbnails.value = thumbnails.value.filter((item) => item.base64)
+    addLog(`重新載入工作區縮圖失敗：${String(error)}`)
+  } finally {
+    isProcessing.value = false
+    initialCaptureCancelRequested.value = false
+    progressText.value = ''
+    progressPercent.value = 0
+  }
+}
+
+function discardRecoveredPreview() {
+  thumbnails.value = []
+  startThumbnail.value = null
+  endThumbnail.value = null
+  showStartEndpoint.value = false
+  showEndEndpoint.value = false
+  selectedTimes.value = []
+  workspaceRecovered.value = false
+  clearWorkspaceDraft()
+  scheduleWorkspaceSave()
+  addLog('已捨棄上次保存的縮圖時間軸，影片與任務欄位仍保留。')
+}
+
 function baseName(path: string) {
   const index = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'))
   return index >= 0 ? path.slice(index + 1) : path
@@ -343,6 +463,9 @@ function handleDocumentClick(event: MouseEvent) {
 
 onMounted(async () => {
   loadPaths()
+  restoreSavedWorkspace()
+  await nextTick()
+  workspaceReady = true
   window.addEventListener('home-navigation', selectVideoFilePanel)
   document.addEventListener('click', handleDocumentClick)
   try {
@@ -376,6 +499,7 @@ onUnmounted(() => {
   window.removeEventListener('home-navigation', selectVideoFilePanel)
   document.removeEventListener('click', handleDocumentClick)
   if (autoClearFinishedTimer) clearTimeout(autoClearFinishedTimer)
+  if (workspaceSaveTimer) clearTimeout(workspaceSaveTimer)
   cancelFilmstripScrollAnimation()
   gridResizeObserver?.disconnect()
   filmstripResizeObserver?.disconnect()
@@ -1678,6 +1802,13 @@ function createCombineTask() {
           </template>
         </div>
         <p class="info-text">點一下選取，點兩下檢視原圖。選取任意兩張後可移除範圍內所有縮圖；擴充後會自動增加列數。</p>
+        <div v-if="workspaceRecovered" class="workspace-recovery">
+          <div><strong>已復原上次工作區</strong><span>時間軸位置已保留，但縮圖圖片不會占用硬碟；可在方便時重新擷取。</span></div>
+          <div class="workspace-recovery-actions">
+            <button class="btn btn-secondary compact" @click="discardRecoveredPreview">捨棄時間軸</button>
+            <button class="btn btn-primary compact" :disabled="isProcessing" @click="reloadRecoveredWorkspaceThumbnails">重新載入縮圖</button>
+          </div>
+        </div>
         <div v-if="hasPreviewContent" ref="gridRef" class="grid-container" @scroll.passive="onGridScroll">
           <div class="grid-virtual-canvas" :style="{ height: `${gridCanvasHeight}px` }">
             <div class="grid-visible-rows" :style="{ top: `${gridFirstRow * gridRowPitch}px`, gridTemplateColumns: `repeat(${gridColumnCount}, minmax(0, 1fr))`, gridAutoRows: `${gridRowPitch - 3}px` }">
@@ -2455,6 +2586,32 @@ select:focus {
   place-items: center;
   color: var(--text-muted);
   border: 1px dashed var(--border-color);
+}
+.workspace-recovery {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid rgba(99, 102, 241, 0.35);
+  border-radius: 9px;
+  background: rgba(99, 102, 241, 0.1);
+  color: #c7d2fe;
+  font-size: 0.82rem;
+}
+.workspace-recovery > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.workspace-recovery span {
+  color: var(--text-muted);
+}
+.workspace-recovery-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
 }
 .current-layout-controls {
   display: flex;

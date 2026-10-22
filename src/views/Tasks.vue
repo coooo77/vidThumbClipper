@@ -22,8 +22,6 @@ let pointerDragSourceId: string | null = null
 let pointerDragStartX = 0
 let pointerDragStartY = 0
 let pointerDragActive = false
-let pointerDragHandle: HTMLElement | null = null
-let pointerDragId: number | null = null
 const safetyWarning = ref('')
 const clockNow = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | null = null
@@ -51,17 +49,15 @@ onMounted(() => {
   scheduledMinute.value = suggestedTime.getMinutes()
   scheduledSecond.value = 0
   startScheduleTimer()
-  window.addEventListener('pointermove', onTaskPointerMove, { passive: false })
-  window.addEventListener('pointerup', onTaskPointerUp)
-  window.addEventListener('pointercancel', finishTaskDrag)
+  window.addEventListener('mousemove', onTaskMouseMove, { passive: false })
+  window.addEventListener('mouseup', onTaskMouseUp)
   window.addEventListener('blur', finishTaskDrag)
 })
 onUnmounted(() => {
   if (clockTimer) clearInterval(clockTimer)
   if (scheduleTimer) clearInterval(scheduleTimer)
-  window.removeEventListener('pointermove', onTaskPointerMove)
-  window.removeEventListener('pointerup', onTaskPointerUp)
-  window.removeEventListener('pointercancel', finishTaskDrag)
+  window.removeEventListener('mousemove', onTaskMouseMove)
+  window.removeEventListener('mouseup', onTaskMouseUp)
   window.removeEventListener('blur', finishTaskDrag)
   finishTaskDrag()
 })
@@ -231,19 +227,16 @@ function reorderTaskRelative(sourceId: string, targetId: string, insertAfter: bo
   }
 }
 
-function onTaskPointerDown(event: PointerEvent, task: VideoTask) {
+function onTaskMouseDown(event: MouseEvent, task: VideoTask) {
   if (event.button !== 0 || !canDragTask(task)) return
   pointerDragSourceId = task.id
   pointerDragStartX = event.clientX
   pointerDragStartY = event.clientY
   pointerDragActive = false
-  pointerDragHandle = event.currentTarget as HTMLElement
-  pointerDragId = event.pointerId
-  pointerDragHandle.setPointerCapture?.(event.pointerId)
   event.preventDefault()
 }
 
-function onTaskPointerMove(event: PointerEvent) {
+function onTaskMouseMove(event: MouseEvent) {
   if (!pointerDragSourceId) return
   if (!pointerDragActive && Math.hypot(event.clientX - pointerDragStartX, event.clientY - pointerDragStartY) < 5) return
   if (!pointerDragActive) {
@@ -267,7 +260,10 @@ function onTaskPointerMove(event: PointerEvent) {
   else if (event.clientY > window.innerHeight - edge) window.scrollBy({ top: 12 })
 }
 
-function onTaskPointerUp() {
+function onTaskMouseUp(event: MouseEvent) {
+  // Some WebView/input combinations coalesce mouse-move events during a drag.
+  // Re-evaluate the final pointer position so a valid drag still commits on release.
+  if (pointerDragSourceId) onTaskMouseMove(event)
   if (pointerDragActive && pointerDragSourceId && dragTargetTaskId.value) {
     reorderTaskRelative(pointerDragSourceId, dragTargetTaskId.value, dragTargetAfter.value)
   }
@@ -275,13 +271,8 @@ function onTaskPointerUp() {
 }
 
 function finishTaskDrag() {
-  if (pointerDragHandle && pointerDragId !== null && pointerDragHandle.hasPointerCapture?.(pointerDragId)) {
-    pointerDragHandle.releasePointerCapture(pointerDragId)
-  }
   pointerDragSourceId = null
   pointerDragActive = false
-  pointerDragHandle = null
-  pointerDragId = null
   draggedTaskId.value = null
   dragTargetTaskId.value = null
   dragTargetAfter.value = false
@@ -620,7 +611,7 @@ async function runTasks() {
             </div>
             <div class="task-row-actions">
               <div v-if="task.status === '等待中'" class="task-order-controls" aria-label="調整任務順序">
-                <button class="task-order-button task-drag-handle" :disabled="running" title="按住並拖曳以調整順序" aria-label="拖曳調整任務順序" @pointerdown="onTaskPointerDown($event, task)">⠿</button>
+                <button class="task-order-button task-drag-handle" :disabled="running" title="按住並拖曳以調整順序" aria-label="拖曳調整任務順序" @mousedown="onTaskMouseDown($event, task)">⠿</button>
                 <button class="task-order-button" :disabled="!canMoveTask(index, -1)" title="向上移動" aria-label="向上移動任務" @click="moveTask(index, -1)">↑</button>
                 <button class="task-order-button" :disabled="!canMoveTask(index, 1)" title="向下移動" aria-label="向下移動任務" @click="moveTask(index, 1)">↓</button>
               </div>

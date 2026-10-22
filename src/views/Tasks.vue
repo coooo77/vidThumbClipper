@@ -5,6 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { useRouter } from 'vue-router'
 import { queueTaskEdit, videoTasks, type VideoSegment, type VideoTask } from '../taskStore'
 import { getNotifySettings, notifyResult } from '../notify'
+import { buildClipRanges, directoryOf, formatTimecode, resolveTaskOutputFolder, taskDestination } from '../videoUtils'
 
 const ffmpegPath = ref('')
 const ffprobePath = ref('')
@@ -39,18 +40,11 @@ onUnmounted(() => {
   if (clockTimer) clearInterval(clockTimer)
   if (scheduleTimer) clearInterval(scheduleTimer)
 })
-function folderOf(path: string) {
-  return path.slice(0, Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/')) + 1)
-}
 function resolveOutputFolder(task: VideoTask) {
-  const own = task.outputDir.trim()
-  if (own) return `${own.replace(/[\\/]$/, '')}\\`
-  const global = outputDirectory.value.trim()
-  if (global) return `${global.replace(/[\\/]$/, '')}\\`
-  return folderOf(task.source)
+  return resolveTaskOutputFolder(task, outputDirectory.value)
 }
 function destination(task: VideoTask, suffix = '') {
-  return `${resolveOutputFolder(task)}${task.outputName}${suffix}.${task.extension.replace(/^\./, '')}`
+  return taskDestination(task, outputDirectory.value, suffix)
 }
 function diskSafetySettings() {
   return {
@@ -74,15 +68,6 @@ async function ensureEnoughDiskSpace(task: VideoTask) {
 }
 function parseExtraArgs(value: string) {
   return value.trim() ? value.trim().split(/\s+/) : []
-}
-function formatTime(seconds: number) {
-  const totalMs = Math.max(0, Math.round(seconds * 1000))
-  const totalSeconds = Math.floor(totalMs / 1000)
-  const base = [Math.floor(totalSeconds / 3600), Math.floor((totalSeconds % 3600) / 60), totalSeconds % 60]
-    .map((value) => String(value).padStart(2, '0'))
-    .join(':')
-  const milliseconds = totalMs % 1000
-  return milliseconds ? `${base}.${String(milliseconds).padStart(3, '0')}` : base
 }
 function formatDuration(seconds: number) {
   const rounded = Math.max(0, Math.round(seconds))
@@ -179,29 +164,11 @@ function taskSummary(task: VideoTask) {
   if (task.kind === 'merge') return `${task.segments.length} 個片段`
   if (task.method === 'duration') return `每 ${task.durationHours} 小時分割`
   if (task.method === 'count') return `平均分割 ${task.splitCount} 段`
-  return `${formatTime(task.segments[0]?.start || 0)} → ${formatTime(task.segments[0]?.end || 0)}`
+  return `${formatTimecode(task.segments[0]?.start || 0)} → ${formatTimecode(task.segments[0]?.end || 0)}`
 }
 
 function taskRanges(task: VideoTask): VideoSegment[] {
-  if (task.segments.length) return task.segments
-  const duration = task.previewTimeline?.duration || 0
-  if (!duration || task.kind !== 'clip') return []
-  if (task.method === 'duration') {
-    const segmentDuration = task.durationHours * 3600
-    if (segmentDuration <= 0) return []
-    return Array.from({ length: Math.ceil(duration / segmentDuration) }, (_, index) => ({
-      start: index * segmentDuration,
-      end: Math.min(duration, (index + 1) * segmentDuration),
-    }))
-  }
-  if (task.method === 'count') {
-    const count = Math.max(1, Math.floor(task.splitCount))
-    return Array.from({ length: count }, (_, index) => ({
-      start: (duration * index) / count,
-      end: (duration * (index + 1)) / count,
-    }))
-  }
-  return []
+  return buildClipRanges(task)
 }
 
 function toggleTaskRanges(taskId: string) {
@@ -300,7 +267,7 @@ async function clipRange(task: VideoTask, range: VideoSegment, path: string) {
   if (expected > 2 && sizeBytes < minSizeBytes) {
     const command = `ffmpeg ${args.map((a) => (a.includes(' ') ? `"${a}"` : a)).join(' ')}`
     throw new Error(
-      `剪輯出的片段檔案異常過小（僅 ${(sizeBytes / 1024).toFixed(1)} KB，要求長度 ${expected.toFixed(1)} 秒）：${formatTime(range.start)} → ${formatTime(range.end)}\n實際指令：${command}\nffmpeg 輸出：${ffmpegOutput.trim() || '(無輸出)'}`,
+      `剪輯出的片段檔案異常過小（僅 ${(sizeBytes / 1024).toFixed(1)} KB，要求長度 ${expected.toFixed(1)} 秒）：${formatTimecode(range.start)} → ${formatTimecode(range.end)}\n實際指令：${command}\nffmpeg 輸出：${ffmpegOutput.trim() || '(無輸出)'}`,
     )
   }
 }
@@ -315,20 +282,7 @@ async function runClipTask(task: VideoTask) {
   const duration = task.method === 'range' || task.segments.length
     ? 0
     : await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: task.source })
-  const ranges: VideoSegment[] =
-    task.segments.length
-      ? task.segments
-      : task.method === 'range'
-        ? task.segments
-        : task.method === 'duration'
-        ? Array.from({ length: Math.ceil(duration / (task.durationHours * 3600)) }, (_, index) => ({
-            start: index * task.durationHours * 3600,
-            end: Math.min(duration, (index + 1) * task.durationHours * 3600),
-          }))
-        : Array.from({ length: task.splitCount }, (_, index) => ({
-            start: (duration * index) / task.splitCount,
-            end: (duration * (index + 1)) / task.splitCount,
-          }))
+  const ranges = buildClipRanges(task, duration)
   startTaskProgress(task, ranges.length, `準備剪輯 ${ranges.length} 個片段`)
   for (let index = 0; index < ranges.length; index += 1)
     {
@@ -406,7 +360,7 @@ async function runTasks() {
         else if (task.kind === 'combine') await runCombineTask(task)
         else await runPreprocessTask(task)
         task.status = '完成'
-        task.message = `已輸出至 ${outputDirectory.value || folderOf(task.source)}`
+        task.message = `已輸出至 ${outputDirectory.value || directoryOf(task.source)}`
         if (trigger === 'each') notifyResult(true)
       } catch (error) {
         if (pendingCancelTaskId.value === task.id) {
@@ -521,7 +475,7 @@ async function runTasks() {
             <div v-if="taskRanges(task).length" class="range-list">
               <div v-for="(range, rangeIndex) in taskRanges(task)" :key="`${range.start}-${range.end}-${rangeIndex}`" class="range-item">
                 <span>片段 {{ rangeIndex + 1 }}</span>
-                <code>{{ formatTime(range.start) }} → {{ formatTime(range.end) }}</code>
+                <code>{{ formatTimecode(range.start) }} → {{ formatTimecode(range.end) }}</code>
               </div>
             </div>
             <p v-else class="range-empty">這筆舊任務沒有保存可展開的實際範圍，執行時會依影片長度計算。</p>

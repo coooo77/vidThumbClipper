@@ -18,6 +18,7 @@ import {
   type VideoTask,
 } from '../taskStore'
 import { clearWorkspaceDraft, loadWorkspaceDraft, saveWorkspaceDraft } from '../workspaceStore'
+import { directoryOf as dirName, formatTimecode as formatSeconds } from '../videoUtils'
 
 interface ThumbnailItem {
   time: number
@@ -442,11 +443,6 @@ function baseNameWithoutExt(path: string) {
   return dot > 0 ? name.slice(0, dot) : name
 }
 
-function dirName(path: string) {
-  const index = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'))
-  return index >= 0 ? path.slice(0, index + 1) : ''
-}
-
 let unlistenDragDrop: (() => void) | null = null
 const infoHintWrap = ref<HTMLElement | null>(null)
 
@@ -506,15 +502,6 @@ onUnmounted(() => {
 })
 
 defineExpose({ loadPaths })
-
-function formatSeconds(seconds: number) {
-  const h = Math.floor(seconds / 3600)
-  const m = Math.floor((seconds % 3600) / 60)
-  const s = Math.floor(seconds % 60)
-  const ms = Math.round((seconds - Math.floor(seconds)) * 1000)
-  const base = [h, m, s].map((value) => String(value).padStart(2, '0')).join(':')
-  return ms ? `${base}.${String(ms).padStart(3, '0')}` : base
-}
 
 function addLog(message: string) {
   logs.value.unshift(`[${new Date().toLocaleTimeString()}] ${message}`)

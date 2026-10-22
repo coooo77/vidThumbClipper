@@ -396,7 +396,8 @@ async fn capture_single_thumbnail(
     video_path: String,
     time: String,
     index: i64,
-    width: u32,
+    max_height: u32,
+    original_size: bool,
     quality: u8,
     seek_mode: String,
     decoder_threads: u8,
@@ -416,7 +417,7 @@ async fn capture_single_thumbnail(
             if cancelled.load(Ordering::SeqCst) {
                 Err("Thumbnail cancelled".to_string())
             } else if std::time::Instant::now() >= deadline {
-                Err("Thumbnail timed out after 30 seconds".to_string())
+                Err("Thumbnail timed out after 90 seconds".to_string())
             } else {
                 Ok(())
             }
@@ -436,10 +437,12 @@ async fn capture_single_thumbnail(
             path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false)
         };
         let mut debug = Vec::new();
-        let width = width.clamp(160, 1920).to_string();
+        let max_height = max_height.clamp(144, 2160);
         let quality = quality.clamp(2, 12).to_string();
         let decoder_threads = decoder_threads.clamp(1, 4).to_string();
-        let scale_filter = format!("scale={width}:-2");
+        // Limit by height (the conventional meaning of 720p) and never enlarge a smaller source.
+        // FFmpeg's expression comma must be escaped so it is not parsed as another filter.
+        let scale_filter = format!("scale=-2:min({max_height}\\,ih)");
         let target_seconds = time
             .parse::<f64>()
             .map_err(|error| format!("Invalid thumbnail timestamp '{time}': {error}"))?;
@@ -470,11 +473,11 @@ async fn capture_single_thumbnail(
                     target_seconds.min(30.0).to_string(),
                 ]);
             }
+            args.extend(["-vframes".to_string(), "1".to_string()]);
+            if !original_size {
+                args.extend(["-vf".to_string(), scale_filter.clone()]);
+            }
             args.extend([
-                "-vframes".to_string(),
-                "1".to_string(),
-                "-vf".to_string(),
-                scale_filter.clone(),
                 "-q:v".to_string(),
                 quality.clone(),
                 "-pix_fmt".to_string(),

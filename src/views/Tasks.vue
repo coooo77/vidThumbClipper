@@ -15,6 +15,9 @@ const showStopConfirm = ref(false)
 const pendingCancelTaskId = ref<string | null>(null)
 const pendingEditTaskId = ref<string | null>(null)
 const expandedTaskIds = ref<string[]>([])
+const draggedTaskId = ref<string | null>(null)
+const dragTargetTaskId = ref<string | null>(null)
+const dragTargetAfter = ref(false)
 const safetyWarning = ref('')
 const clockNow = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | null = null
@@ -176,6 +179,66 @@ function taskSummary(task: VideoTask) {
 
 function taskRanges(task: VideoTask): VideoSegment[] {
   return buildClipRanges(task)
+}
+
+function waitingNeighborIndex(index: number, direction: -1 | 1) {
+  for (let candidate = index + direction; candidate >= 0 && candidate < videoTasks.length; candidate += direction) {
+    if (videoTasks[candidate].status === '等待中') return candidate
+  }
+  return -1
+}
+
+function canMoveTask(index: number, direction: -1 | 1) {
+  return !running.value && videoTasks[index]?.status === '等待中' && waitingNeighborIndex(index, direction) !== -1
+}
+
+function moveTask(index: number, direction: -1 | 1) {
+  if (!canMoveTask(index, direction)) return
+  const targetIndex = waitingNeighborIndex(index, direction)
+  const task = videoTasks[index]
+  videoTasks[index] = videoTasks[targetIndex]
+  videoTasks[targetIndex] = task
+}
+
+function canDragTask(task: VideoTask) {
+  return !running.value && task.status === '等待中'
+}
+
+function onTaskDragStart(event: DragEvent, task: VideoTask) {
+  if (!canDragTask(task)) return event.preventDefault()
+  draggedTaskId.value = task.id
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', task.id)
+  }
+}
+
+function onTaskDragOver(event: DragEvent, task: VideoTask) {
+  if (!draggedTaskId.value || draggedTaskId.value === task.id || !canDragTask(task)) return
+  event.preventDefault()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+  const row = event.currentTarget as HTMLElement
+  dragTargetTaskId.value = task.id
+  dragTargetAfter.value = event.clientY >= row.getBoundingClientRect().top + row.offsetHeight / 2
+}
+
+function onTaskDrop(event: DragEvent, task: VideoTask) {
+  event.preventDefault()
+  const sourceIndex = videoTasks.findIndex((item) => item.id === draggedTaskId.value)
+  const targetIndex = videoTasks.findIndex((item) => item.id === task.id)
+  if (sourceIndex !== -1 && targetIndex !== -1 && sourceIndex !== targetIndex && canDragTask(task)) {
+    let insertAt = targetIndex + (dragTargetAfter.value ? 1 : 0)
+    const [moved] = videoTasks.splice(sourceIndex, 1)
+    if (sourceIndex < insertAt) insertAt -= 1
+    videoTasks.splice(insertAt, 0, moved)
+  }
+  finishTaskDrag()
+}
+
+function finishTaskDrag() {
+  draggedTaskId.value = null
+  dragTargetTaskId.value = null
+  dragTargetAfter.value = false
 }
 
 function toggleTaskRanges(taskId: string) {
@@ -445,7 +508,18 @@ async function runTasks() {
     </section>
     <section class="card">
       <p v-if="!videoTasks.length" class="info">尚無等待任務。請回到「影片擷取與剪輯」從 Grid 建立任務。</p>
-      <div v-for="(task, index) in videoTasks" :key="task.id" class="task-row">
+      <div
+        v-for="(task, index) in videoTasks"
+        :key="task.id"
+        class="task-row"
+        :class="{
+          'task-dragging': draggedTaskId === task.id,
+          'task-drag-before': dragTargetTaskId === task.id && !dragTargetAfter,
+          'task-drag-after': dragTargetTaskId === task.id && dragTargetAfter,
+        }"
+        @dragover="onTaskDragOver($event, task)"
+        @drop="onTaskDrop($event, task)"
+      >
         <div class="task-content w-full">
           <div class="task-header">
             <div class="task-heading">
@@ -455,6 +529,11 @@ async function runTasks() {
               ><span class="status" :class="task.status">{{ task.status }}</span><span class="task-summary">{{ taskSummary(task) }}</span>
             </div>
             <div class="task-row-actions">
+              <div v-if="task.status === '等待中'" class="task-order-controls" aria-label="調整任務順序">
+                <button class="task-order-button task-drag-handle" :draggable="canDragTask(task)" :disabled="running" title="拖曳調整順序" aria-label="拖曳調整任務順序" @dragstart="onTaskDragStart($event, task)" @dragend="finishTaskDrag">⠿</button>
+                <button class="task-order-button" :disabled="!canMoveTask(index, -1)" title="向上移動" aria-label="向上移動任務" @click="moveTask(index, -1)">↑</button>
+                <button class="task-order-button" :disabled="!canMoveTask(index, 1)" title="向下移動" aria-label="向下移動任務" @click="moveTask(index, 1)">↓</button>
+              </div>
               <button
                 v-if="task.kind === 'clip' || task.kind === 'merge'"
                 class="task-control task-control-range"
@@ -614,6 +693,7 @@ async function runTasks() {
   color: var(--text-muted);
 }
 .task-row {
+  position: relative;
   display: flex;
   gap: 1rem;
   padding: 1rem;
@@ -621,6 +701,27 @@ async function runTasks() {
   border: 1px solid var(--border-color);
   border-radius: 10px;
   background: rgba(15, 23, 42, 0.45);
+  transition: border-color 0.16s ease, opacity 0.16s ease, transform 0.16s ease;
+}
+.task-row.task-dragging {
+  opacity: 0.45;
+}
+.task-row.task-drag-before::before,
+.task-row.task-drag-after::after {
+  content: '';
+  position: absolute;
+  left: 0.75rem;
+  right: 0.75rem;
+  height: 3px;
+  border-radius: 999px;
+  background: #818cf8;
+  box-shadow: 0 0 10px rgba(129, 140, 248, 0.55);
+}
+.task-row.task-drag-before::before {
+  top: -0.45rem;
+}
+.task-row.task-drag-after::after {
+  bottom: -0.45rem;
 }
 .task-content {
   min-width: 0;
@@ -668,6 +769,41 @@ async function runTasks() {
   align-items: center;
   gap: 0.45rem;
   flex-shrink: 0;
+}
+.task-order-controls {
+  display: inline-flex;
+  gap: 0.2rem;
+  padding-right: 0.2rem;
+  border-right: 1px solid rgba(148, 163, 184, 0.18);
+}
+.task-order-button {
+  display: inline-grid;
+  width: 29px;
+  height: 34px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid rgba(129, 140, 248, 0.18);
+  border-radius: 7px;
+  background: rgba(30, 41, 59, 0.55);
+  color: #cbd5e1;
+  font: inherit;
+  cursor: pointer;
+}
+.task-order-button:hover:not(:disabled) {
+  border-color: rgba(129, 140, 248, 0.48);
+  background: rgba(99, 102, 241, 0.18);
+  color: #fff;
+}
+.task-order-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.3;
+}
+.task-drag-handle:not(:disabled) {
+  cursor: grab;
+  font-size: 1rem;
+}
+.task-drag-handle:not(:disabled):active {
+  cursor: grabbing;
 }
 .task-control {
   display: inline-flex;

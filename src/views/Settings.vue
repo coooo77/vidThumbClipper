@@ -17,7 +17,8 @@ const notifyOnFailure = ref(true)
 const diskSafetyEnabled = ref(false)
 const diskSafetyMinGb = ref(100)
 const thumbnailPreset = ref<ThumbnailPreset>('balanced')
-const thumbnailWidth = ref(480)
+const thumbnailMaxHeight = ref(720)
+const thumbnailOriginalSize = ref(false)
 const thumbnailQuality = ref(5)
 const thumbnailSeekMode = ref<ThumbnailSeekMode>('precise')
 const thumbnailDecoderThreads = ref(2)
@@ -37,7 +38,8 @@ onMounted(() => {
   diskSafetyMinGb.value = Math.max(1, Number(localStorage.getItem('vid_disk_safety_min_gb')) || 100)
   const thumbnail = getThumbnailSettings()
   thumbnailPreset.value = thumbnail.preset
-  thumbnailWidth.value = thumbnail.width
+  thumbnailMaxHeight.value = thumbnail.maxHeight
+  thumbnailOriginalSize.value = thumbnail.originalSize
   thumbnailQuality.value = thumbnail.quality
   thumbnailSeekMode.value = thumbnail.seekMode
   thumbnailDecoderThreads.value = thumbnail.decoderThreads
@@ -60,7 +62,8 @@ function saveSettings() {
   localStorage.setItem('vid_disk_safety_min_gb', String(Math.max(1, Number(diskSafetyMinGb.value) || 100)))
   saveThumbnailSettings({
     preset: thumbnailPreset.value,
-    width: thumbnailWidth.value,
+    maxHeight: thumbnailMaxHeight.value,
+    originalSize: thumbnailOriginalSize.value,
     quality: thumbnailQuality.value,
     seekMode: thumbnailSeekMode.value,
     decoderThreads: thumbnailDecoderThreads.value,
@@ -71,7 +74,8 @@ function saveSettings() {
 }
 function applyThumbnailPreset() {
   const settings = settingsForPreset(thumbnailPreset.value)
-  thumbnailWidth.value = settings.width
+  thumbnailMaxHeight.value = settings.maxHeight
+  thumbnailOriginalSize.value = settings.originalSize
   thumbnailQuality.value = settings.quality
   thumbnailSeekMode.value = settings.seekMode
   thumbnailDecoderThreads.value = settings.decoderThreads
@@ -153,17 +157,30 @@ async function clearThumbnailCache() {
 
     <section class="card settings-card">
       <h2 class="card-title">縮圖擷取預設</h2>
-      <p class="description">首頁每次開啟時會套用這組預設。降低寬度通常比單純降低 JPEG 畫質更能提升速度與減少記憶體。</p>
+      <p class="description">首頁每次開啟時會套用這組預設。預設最大高度為 720p；來源影片較小時會保留原始尺寸，不會放大。</p>
       <div class="input-group">
         <label>品質方案</label>
         <select v-model="thumbnailPreset" @change="applyThumbnailPreset">
-          <option value="fast">快速（320px、最多同時 2 張）</option>
-          <option value="balanced">平衡（480px、低負載）</option>
-          <option value="high">高品質（720px、精確定位）</option>
+          <option value="fast">快速（360p、最多同時 2 張）</option>
+          <option value="balanced">平衡（720p、低負載）</option>
+          <option value="high">高品質（1080p、精確定位）</option>
         </select>
       </div>
       <div class="thumbnail-default-grid">
-        <div class="input-group"><label>縮圖寬度</label><input v-model.number="thumbnailWidth" type="number" min="160" max="1920" step="40" @change="saveSettings" /></div>
+        <div class="input-group thumbnail-size-setting">
+          <label>最大高度（px）</label>
+          <div class="thumbnail-size-control">
+            <input v-model.number="thumbnailMaxHeight" :disabled="thumbnailOriginalSize" type="number" min="144" max="2160" step="40" @change="saveSettings" />
+            <button
+              type="button"
+              class="original-size-button"
+              :class="{ active: thumbnailOriginalSize }"
+              :aria-pressed="thumbnailOriginalSize"
+              @click="thumbnailOriginalSize = !thumbnailOriginalSize; saveSettings()"
+            >{{ thumbnailOriginalSize ? '✓ 原始尺寸' : '使用原始尺寸' }}</button>
+          </div>
+          <p class="field-hint">設定的是高度上限；影片本身較小時不會放大。</p>
+        </div>
         <div class="input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" type="number" min="2" max="12" @change="saveSettings" /></div>
         <div class="input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" @change="saveSettings"><option value="fast">快速</option><option value="precise">精確</option></select></div>
         <div class="input-group"><label>解碼執行緒</label><input v-model.number="thumbnailDecoderThreads" type="number" min="1" max="4" @change="saveSettings" /></div>
@@ -280,6 +297,29 @@ async function clearThumbnailCache() {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0 1rem;
+}
+.thumbnail-size-setting {
+  grid-column: 1 / -1;
+}
+.thumbnail-size-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.65rem;
+}
+.original-size-button {
+  min-width: 8.5rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid rgba(129, 140, 248, 0.35);
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.8);
+  color: #c7d2fe;
+  font: inherit;
+  cursor: pointer;
+}
+.original-size-button.active {
+  border-color: rgba(129, 140, 248, 0.75);
+  background: rgba(79, 70, 229, 0.32);
+  color: #eef2ff;
 }
 .thumbnail-default-grid select,
 .settings-card > .input-group select {

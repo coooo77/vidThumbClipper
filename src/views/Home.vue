@@ -51,6 +51,7 @@ interface ExpansionJob {
   status: QueueStatus
   message: string
   cancelRequested: boolean
+  times: number[]
 }
 
 const ffmpegPath = ref('')
@@ -68,7 +69,8 @@ const logs = ref<string[]>([])
 const progressText = ref('')
 const progressPercent = ref(0)
 const thumbnailPreset = ref<ThumbnailPreset>('balanced')
-const thumbnailWidth = ref(480)
+const thumbnailMaxHeight = ref(720)
+const thumbnailOriginalSize = ref(false)
 const thumbnailQuality = ref(5)
 const thumbnailSeekMode = ref<ThumbnailSeekMode>('precise')
 const thumbnailDecoderThreads = ref(2)
@@ -334,7 +336,8 @@ function loadPaths() {
   taskNameSuffix.value = localStorage.getItem('vid_task_suffix') || '_edit'
   const thumbnail = getThumbnailSettings()
   thumbnailPreset.value = thumbnail.preset
-  thumbnailWidth.value = thumbnail.width
+  thumbnailMaxHeight.value = thumbnail.maxHeight
+  thumbnailOriginalSize.value = thumbnail.originalSize
   thumbnailQuality.value = thumbnail.quality
   thumbnailSeekMode.value = thumbnail.seekMode
   thumbnailDecoderThreads.value = thumbnail.decoderThreads
@@ -344,7 +347,8 @@ function loadPaths() {
 
 function applyThumbnailPreset() {
   const settings = settingsForPreset(thumbnailPreset.value)
-  thumbnailWidth.value = settings.width
+  thumbnailMaxHeight.value = settings.maxHeight
+  thumbnailOriginalSize.value = settings.originalSize
   thumbnailQuality.value = settings.quality
   thumbnailSeekMode.value = settings.seekMode
   thumbnailDecoderThreads.value = settings.decoderThreads
@@ -355,7 +359,8 @@ function applyThumbnailPreset() {
 function currentThumbnailSettings(): ThumbnailSettings {
   return normaliseThumbnailSettings({
     preset: thumbnailPreset.value,
-    width: thumbnailWidth.value,
+    maxHeight: thumbnailMaxHeight.value,
+    originalSize: thumbnailOriginalSize.value,
     quality: thumbnailQuality.value,
     seekMode: thumbnailSeekMode.value,
     decoderThreads: thumbnailDecoderThreads.value,
@@ -945,7 +950,8 @@ async function captureThumbnail(args: Record<string, unknown>, shouldStop?: () =
     const captureArgs = {
       ...args,
       requestId,
-      width: settings.width,
+      maxHeight: settings.maxHeight,
+      originalSize: settings.originalSize,
       quality: settings.quality,
       seekMode: settings.seekMode,
       decoderThreads: settings.decoderThreads,
@@ -1323,7 +1329,17 @@ function queueExpansionJob() {
     status: '等待中',
     message: '',
     cancelRequested: false,
+    times: [],
   }
+  job.times = buildTimesForJob(job)
+  if (!job.times.length) return addLog('無法加入截圖任務：目前設定沒有可插入的時間點。')
+  const insertAt = indexForTime(job.anchorEndTime)
+  thumbnails.value.splice(
+    insertAt,
+    0,
+    ...job.times.map((time) => ({ time, timeStr: formatSeconds(time), base64: '' })),
+  )
+  normaliseLayout()
   expansionQueue.value.push(job)
   selectedTimes.value = []
   addLog(`已加入截圖任務：${job.label}`)
@@ -1332,7 +1348,15 @@ function queueExpansionJob() {
 
 function removeExpansionJob(id: string) {
   const index = expansionQueue.value.findIndex((job) => job.id === id && job.status === '等待中')
-  if (index !== -1) expansionQueue.value.splice(index, 1)
+  if (index === -1) return
+  removeUnfinishedExpansionPlaceholders(expansionQueue.value[index])
+  expansionQueue.value.splice(index, 1)
+}
+
+function removeUnfinishedExpansionPlaceholders(job: ExpansionJob) {
+  const timeSet = new Set(job.times)
+  thumbnails.value = thumbnails.value.filter((item) => item.base64 || !timeSet.has(item.time))
+  normaliseLayout()
 }
 
 // Stop the current backend capture as well as subsequent frames; completed frames stay visible.
@@ -1369,7 +1393,7 @@ watch(
 )
 
 async function runExpansionJob(job: ExpansionJob) {
-  const times = buildTimesForJob(job)
+  const times = job.times
   if (!times.length) {
     const span = Math.max(0, job.anchorEndTime - job.anchorStartTime)
     const interval = Math.max(1, Math.floor(Number(job.interval) || 1))
@@ -1378,10 +1402,6 @@ async function runExpansionJob(job: ExpansionJob) {
     addLog(`擴充失敗（${job.label}）：${message}`)
     throw new Error(message)
   }
-  const insertAt = indexForTime(job.anchorEndTime)
-  const placeholders = times.map((time) => ({ time, timeStr: formatSeconds(time), base64: '' }))
-  thumbnails.value.splice(insertAt, 0, ...placeholders)
-  normaliseLayout()
   let additions: ThumbnailItem[] = []
   try {
     additions = await captureAtTimes(times, thumbnails.value.length, () => job.cancelRequested, (item) => {
@@ -1389,13 +1409,11 @@ async function runExpansionJob(job: ExpansionJob) {
       if (target) target.base64 = item.base64
     })
   } catch (error) {
-    const timeSet = new Set(times)
-    thumbnails.value = thumbnails.value.filter((item) => item.base64 || !timeSet.has(item.time))
+    removeUnfinishedExpansionPlaceholders(job)
     throw error
   }
   if (job.cancelRequested) {
-    const timeSet = new Set(times)
-    thumbnails.value = thumbnails.value.filter((item) => item.base64 || !timeSet.has(item.time))
+    removeUnfinishedExpansionPlaceholders(job)
   }
   normaliseLayout()
   if (job.cancelRequested) {
@@ -1695,16 +1713,28 @@ function createCombineTask() {
           </button>
           <div v-if="showAdvancedCaptureSettings" class="advanced-capture-settings">
             <p v-if="thumbnailSettingsLocked" class="capture-settings-lock-note">正在擷取，本批已鎖定開始時的設定；調整功能會在完成後恢復。</p>
-            <div class="row">
-              <div class="col input-group"><label>寬度（px）</label><input v-model.number="thumbnailWidth" :disabled="thumbnailSettingsLocked" type="number" min="160" max="1920" step="40" /></div>
-              <div class="col input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" :disabled="thumbnailSettingsLocked" type="number" min="2" max="12" /></div>
+            <div class="advanced-settings-grid">
+              <div class="input-group advanced-size-field">
+                <label>最大高度（px）</label>
+                <div class="capture-size-control">
+                  <input v-model.number="thumbnailMaxHeight" :disabled="thumbnailSettingsLocked || thumbnailOriginalSize" type="number" min="144" max="2160" step="40" />
+                  <button
+                    type="button"
+                    class="original-size-button"
+                    :class="{ active: thumbnailOriginalSize }"
+                    :disabled="thumbnailSettingsLocked"
+                    :aria-pressed="thumbnailOriginalSize"
+                    @click="thumbnailOriginalSize = !thumbnailOriginalSize"
+                  >{{ thumbnailOriginalSize ? '✓ 原始尺寸' : '使用原始尺寸' }}</button>
+                </div>
+                <p class="capture-setting-hint">預設 720p；來源影片較小時不會放大。</p>
+              </div>
+              <div class="input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" :disabled="thumbnailSettingsLocked" type="number" min="2" max="12" /></div>
+              <div class="input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" :disabled="thumbnailSettingsLocked"><option value="precise">精確（預設）</option><option value="fast">快速</option></select></div>
+              <div class="input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency" :disabled="thumbnailSettingsLocked"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
+              <div class="input-group"><label>解碼執行緒（1–4）</label><input v-model.number="thumbnailDecoderThreads" :disabled="thumbnailSettingsLocked" type="number" min="1" max="4" /></div>
+              <label class="checkbox-row advanced-setting-checkbox"><input v-model="thumbnailHardwareAcceleration" :disabled="thumbnailSettingsLocked" type="checkbox" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>
             </div>
-            <div class="row">
-              <div class="col input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" :disabled="thumbnailSettingsLocked"><option value="precise">精確（預設）</option><option value="fast">快速</option></select></div>
-              <div class="col input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency" :disabled="thumbnailSettingsLocked"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
-            </div>
-            <div class="input-group"><label>解碼執行緒（1–4）</label><input v-model.number="thumbnailDecoderThreads" :disabled="thumbnailSettingsLocked" type="number" min="1" max="4" /></div>
-            <label class="checkbox-row"><input v-model="thumbnailHardwareAcceleration" :disabled="thumbnailSettingsLocked" type="checkbox" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>
           </div>
           <div class="mode-row">
             <label><input v-model="initialCaptureMode" type="radio" value="grid" /> 依欄列等分</label>
@@ -2761,6 +2791,59 @@ select:focus {
   border-radius: 9px;
   background: rgba(99, 102, 241, 0.06);
 }
+.advanced-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.85rem 0.9rem;
+  align-items: start;
+}
+.advanced-settings-grid .input-group {
+  min-width: 0;
+  margin: 0;
+}
+.advanced-settings-grid .input-group > label {
+  display: block;
+  min-height: 2.1em;
+}
+.advanced-size-field,
+.advanced-setting-checkbox {
+  grid-column: 1 / -1;
+}
+.capture-size-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.45rem;
+}
+.original-size-button {
+  min-width: 7.4rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid rgba(129, 140, 248, 0.35);
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.8);
+  color: #c7d2fe;
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.original-size-button.active {
+  border-color: rgba(129, 140, 248, 0.75);
+  background: rgba(79, 70, 229, 0.32);
+  color: #eef2ff;
+}
+.original-size-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.capture-setting-hint {
+  margin: 0.35rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+.advanced-setting-checkbox {
+  min-height: 43px;
+  margin-top: 0;
+}
 .capture-settings-lock-note {
   margin-bottom: 0.8rem;
   color: #fbbf24;
@@ -3001,6 +3084,8 @@ select:focus {
   margin: 0 auto;
 }
 .fit-mode .original-size-img {
+  width: 100%;
+  height: 100%;
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;

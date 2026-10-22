@@ -225,6 +225,22 @@ fn get_file_size(path: String) -> Result<u64, String> {
         .map_err(|error| format!("Unable to read file size: {error}"))
 }
 
+#[tauri::command]
+fn export_debug_log(path: String, content: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Unable to export debug log: path is empty".to_string());
+    }
+    let header = format!(
+        "vidThumbClipper diagnostic log\napp_version={}\nplatform={}-{}\n\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    std::fs::write(trimmed, format!("{header}{content}"))
+        .map_err(|error| format!("Unable to export debug log to '{trimmed}': {error}"))
+}
+
 #[cfg(target_os = "windows")]
 fn available_space_for_path(path: &str) -> Result<u64, String> {
     use std::os::windows::ffi::OsStrExt;
@@ -698,6 +714,7 @@ pub fn run() {
             clear_thumbnail_cache,
             delete_file,
             get_file_size,
+            export_debug_log,
             get_available_space,
             concat_videos,
             cancel_current_task

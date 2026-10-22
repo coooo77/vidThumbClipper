@@ -2,7 +2,7 @@
 import { computed, nextTick, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import { useRouter } from 'vue-router'
 import {
   newTaskId,
@@ -119,6 +119,7 @@ const combineOutputName = ref('merged_video')
 const combineExtension = ref('mp4')
 const loadSubPanel = ref<'source' | 'init' | 'expand'>('source')
 const logOpen = ref(false)
+const exportingLog = ref(false)
 const showDeleteProcessedConfirm = ref(false)
 const isDeletingProcessed = ref(false)
 const router = useRouter()
@@ -553,10 +554,75 @@ defineExpose({ loadPaths })
 
 function addLog(message: string) {
   logs.value.unshift(`[${new Date().toLocaleTimeString()}] ${message}`)
+  if (logs.value.length > 1000) logs.value.length = 1000
 }
 
 function clearLogs() {
   logs.value = []
+}
+
+function debugLogContent() {
+  const taskSummary = videoTasks.map((task) => ({
+    id: task.id,
+    kind: task.kind,
+    status: task.status,
+    source: task.source,
+    outputDir: task.outputDir,
+    outputName: `${task.outputName}.${task.extension}`,
+    segments: task.segments,
+    message: task.message,
+  }))
+  const diagnostics = {
+    exportedAt: new Date().toISOString(),
+    userAgent: navigator.userAgent,
+    currentVideo: videoPath.value,
+    originalSource: originalSourcePath.value,
+    videoDurationSeconds: videoDuration.value,
+    preview: {
+      totalSlots: gridSequence.value.length,
+      loadedMiddleThumbnails: thumbnails.value.filter((item) => item.base64).length,
+      gridCols: gridCols.value,
+      gridRows: gridRows.value,
+      selectedTimes: selectedTimes.value,
+      processing: isProcessing.value || isEndpointProcessing.value || isExpanding.value,
+    },
+    thumbnailSettings: currentThumbnailSettings(),
+    configuredTools: {
+      ffmpegPath: ffmpegPath.value || '(PATH/default)',
+      ffprobePath: ffprobePath.value || '(PATH/default)',
+    },
+    tasks: taskSummary,
+  }
+  return [
+    '注意：此檔案可能包含本機影片與輸出資料夾的完整路徑，分享前請自行確認。',
+    '',
+    '=== Diagnostics ===',
+    JSON.stringify(diagnostics, null, 2),
+    '',
+    `=== Operation log (${logs.value.length}, oldest to newest) ===`,
+    ...[...logs.value].reverse(),
+    '',
+  ].join('\n')
+}
+
+async function exportDebugLog() {
+  if (exportingLog.value) return
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  const selected = await save({
+    title: '匯出除錯紀錄（可能包含本機檔案路徑）',
+    defaultPath: `vidThumbClipper-debug-${stamp}.txt`,
+    filters: [{ name: 'Text log', extensions: ['txt', 'log'] }],
+  })
+  if (!selected) return
+  exportingLog.value = true
+  try {
+    await invoke('export_debug_log', { path: selected, content: debugLogContent() })
+    addLog(`已匯出除錯紀錄：${selected}`)
+  } catch (error) {
+    addLog(`匯出除錯紀錄失敗：${String(error)}`)
+  } finally {
+    exportingLog.value = false
+  }
 }
 
 function openModal(index: number) {
@@ -1964,6 +2030,7 @@ function createCombineTask() {
       <div class="log-fullscreen-header">
         <h2>操作紀錄</h2>
         <div class="log-fullscreen-actions">
+          <button class="btn btn-secondary compact" :disabled="exportingLog" title="會包含錯誤全文、設定及本機檔案路徑" @click="exportDebugLog">{{ exportingLog ? '匯出中…' : '匯出除錯紀錄' }}</button>
           <button class="btn-clear" @click="clearLogs">清除</button>
           <button class="log-close-btn" @click="logOpen = false">×</button>
         </div>

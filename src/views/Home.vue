@@ -19,7 +19,14 @@ import {
 } from '../taskStore'
 import { clearWorkspaceDraft, loadWorkspaceDraft, saveWorkspaceDraft } from '../workspaceStore'
 import { directoryOf as dirName, formatTimecode as formatSeconds } from '../videoUtils'
-import { getThumbnailSettings, settingsForPreset, type ThumbnailPreset, type ThumbnailSeekMode } from '../thumbnailSettings'
+import {
+  getThumbnailSettings,
+  normaliseThumbnailSettings,
+  settingsForPreset,
+  type ThumbnailPreset,
+  type ThumbnailSeekMode,
+  type ThumbnailSettings,
+} from '../thumbnailSettings'
 
 interface ThumbnailItem {
   time: number
@@ -68,6 +75,7 @@ const thumbnailDecoderThreads = ref(2)
 const thumbnailConcurrency = ref<1 | 2>(1)
 const thumbnailHardwareAcceleration = ref(false)
 const showAdvancedCaptureSettings = ref(false)
+const thumbnailSettingsLocked = computed(() => isProcessing.value || isEndpointProcessing.value || isExpanding.value)
 const workspaceRecovered = ref(false)
 let workspaceReady = false
 let workspaceSaveTimer: ReturnType<typeof setTimeout> | null = null
@@ -341,6 +349,18 @@ function applyThumbnailPreset() {
   thumbnailDecoderThreads.value = settings.decoderThreads
   thumbnailConcurrency.value = settings.concurrency
   thumbnailHardwareAcceleration.value = settings.hardwareAcceleration
+}
+
+function currentThumbnailSettings(): ThumbnailSettings {
+  return normaliseThumbnailSettings({
+    preset: thumbnailPreset.value,
+    width: thumbnailWidth.value,
+    quality: thumbnailQuality.value,
+    seekMode: thumbnailSeekMode.value,
+    decoderThreads: thumbnailDecoderThreads.value,
+    concurrency: thumbnailConcurrency.value,
+    hardwareAcceleration: thumbnailHardwareAcceleration.value,
+  })
 }
 
 function restoreSavedWorkspace() {
@@ -850,7 +870,7 @@ async function deleteAllProcessedVideos() {
 
 const activeThumbnailRequests = new Set<string>()
 
-async function captureThumbnail(args: Record<string, unknown>, shouldStop?: () => boolean) {
+async function captureThumbnail(args: Record<string, unknown>, shouldStop?: () => boolean, settings = currentThumbnailSettings()) {
   const requestId = newTaskId()
   await invoke('begin_thumbnail', { requestId })
   try {
@@ -859,16 +879,16 @@ async function captureThumbnail(args: Record<string, unknown>, shouldStop?: () =
     const captureArgs = {
       ...args,
       requestId,
-      width: thumbnailWidth.value,
-      quality: thumbnailQuality.value,
-      seekMode: thumbnailSeekMode.value,
-      decoderThreads: thumbnailDecoderThreads.value,
-      hardwareAcceleration: thumbnailHardwareAcceleration.value,
+      width: settings.width,
+      quality: settings.quality,
+      seekMode: settings.seekMode,
+      decoderThreads: settings.decoderThreads,
+      hardwareAcceleration: settings.hardwareAcceleration,
     }
     try {
       return await invoke<string>('capture_single_thumbnail', captureArgs)
     } catch (error) {
-      if (!thumbnailHardwareAcceleration.value) throw error
+      if (!settings.hardwareAcceleration) throw error
       addLog('硬體解碼無法完成此張縮圖，已自動改用軟體解碼。')
       return await invoke<string>('capture_single_thumbnail', { ...captureArgs, hardwareAcceleration: false })
     }
@@ -887,6 +907,7 @@ function stopActiveThumbnail() {
 
 async function captureAtTimes(times: number[], offset: number, shouldStop?: () => boolean, onCaptured?: (item: ThumbnailItem, index: number) => void) {
   const result: ThumbnailItem[] = []
+  const settings = currentThumbnailSettings()
   let nextIndex = 0
   let completed = 0
   let firstError: unknown = null
@@ -903,7 +924,7 @@ async function captureAtTimes(times: number[], offset: number, shouldStop?: () =
           videoPath: videoPath.value,
           time: times[index].toFixed(3),
           index: offset + index,
-        }, shouldStop)
+        }, shouldStop, settings)
         const item = { time: times[index], timeStr: formatSeconds(times[index]), base64: `data:image/jpeg;base64,${base64}` }
         result.push(item)
         onCaptured?.(item, index)
@@ -920,7 +941,7 @@ async function captureAtTimes(times: number[], offset: number, shouldStop?: () =
       }
     }
   }
-  const workerCount = Math.min(thumbnailConcurrency.value, Math.max(1, times.length))
+  const workerCount = Math.min(settings.concurrency, Math.max(1, times.length))
   await Promise.all(Array.from({ length: workerCount }, worker))
   if (firstError) throw firstError
   return result.sort((a, b) => a.time - b.time)
@@ -995,6 +1016,7 @@ function cancelInitialThumbnailCapture() {
 async function captureEndpointThumbnails(duration: number) {
   if (!showStartEndpoint.value && !showEndEndpoint.value) return
   isEndpointProcessing.value = true
+  const settings = currentThumbnailSettings()
   addLog('開始背景擷取起點與終點縮圖；這不會阻塞擴充佇列。')
   try {
     const endpointResults = await Promise.allSettled([
@@ -1004,7 +1026,7 @@ async function captureEndpointThumbnails(duration: number) {
             videoPath: videoPath.value,
             time: '0.000',
             index: -1,
-          })
+          }, undefined, settings)
         : Promise.resolve(null),
       showEndEndpoint.value
         ? captureThumbnail({
@@ -1014,7 +1036,7 @@ async function captureEndpointThumbnails(duration: number) {
             // report a final timestamp for which input-side seek produces an empty image.
             time: Math.max(0, duration - 2).toFixed(3),
             index: -2,
-          })
+          }, undefined, settings)
         : Promise.resolve(null),
     ])
     const [startResult, endResult] = endpointResults
@@ -1596,7 +1618,7 @@ function createCombineTask() {
           <div v-if="loadSubPanel === 'init'" class="subsection capture-section">
           <div class="input-group capture-quality-field">
             <label>縮圖品質</label>
-            <select v-model="thumbnailPreset" @change="applyThumbnailPreset">
+            <select v-model="thumbnailPreset" :disabled="thumbnailSettingsLocked" @change="applyThumbnailPreset">
               <option value="fast">快速</option>
               <option value="balanced">平衡</option>
               <option value="high">高品質</option>
@@ -1606,16 +1628,17 @@ function createCombineTask() {
             {{ showAdvancedCaptureSettings ? '收合進階截圖設定 ▴' : '進階截圖設定 ▾' }}
           </button>
           <div v-if="showAdvancedCaptureSettings" class="advanced-capture-settings">
+            <p v-if="thumbnailSettingsLocked" class="capture-settings-lock-note">正在擷取，本批已鎖定開始時的設定；調整功能會在完成後恢復。</p>
             <div class="row">
-              <div class="col input-group"><label>寬度（px）</label><input v-model.number="thumbnailWidth" type="number" min="160" max="1920" step="40" /></div>
-              <div class="col input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" type="number" min="2" max="12" /></div>
+              <div class="col input-group"><label>寬度（px）</label><input v-model.number="thumbnailWidth" :disabled="thumbnailSettingsLocked" type="number" min="160" max="1920" step="40" /></div>
+              <div class="col input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" :disabled="thumbnailSettingsLocked" type="number" min="2" max="12" /></div>
             </div>
             <div class="row">
-              <div class="col input-group"><label>定位模式</label><select v-model="thumbnailSeekMode"><option value="precise">精確（預設）</option><option value="fast">快速</option></select></div>
-              <div class="col input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
+              <div class="col input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" :disabled="thumbnailSettingsLocked"><option value="precise">精確（預設）</option><option value="fast">快速</option></select></div>
+              <div class="col input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency" :disabled="thumbnailSettingsLocked"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
             </div>
-            <div class="input-group"><label>解碼執行緒（1–4）</label><input v-model.number="thumbnailDecoderThreads" type="number" min="1" max="4" /></div>
-            <label class="checkbox-row"><input v-model="thumbnailHardwareAcceleration" type="checkbox" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>
+            <div class="input-group"><label>解碼執行緒（1–4）</label><input v-model.number="thumbnailDecoderThreads" :disabled="thumbnailSettingsLocked" type="number" min="1" max="4" /></div>
+            <label class="checkbox-row"><input v-model="thumbnailHardwareAcceleration" :disabled="thumbnailSettingsLocked" type="checkbox" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>
           </div>
           <div class="mode-row">
             <label><input v-model="initialCaptureMode" type="radio" value="grid" /> 依欄列等分</label>
@@ -2670,6 +2693,12 @@ select:focus {
   border: 1px solid rgba(99, 102, 241, 0.2);
   border-radius: 9px;
   background: rgba(99, 102, 241, 0.06);
+}
+.capture-settings-lock-note {
+  margin-bottom: 0.8rem;
+  color: #fbbf24;
+  font-size: 0.78rem;
+  line-height: 1.45;
 }
 .workspace-recovery {
   display: flex;

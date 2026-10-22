@@ -392,7 +392,9 @@ async fn capture_single_thumbnail(
         .get(&request_id)
         .cloned()
         .ok_or("Unknown thumbnail request")?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // A complete precise-seek fallback may need longer on multi-hour transport streams. Each
+    // individual attempt is still bounded so one bad timestamp cannot hang the queue forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     tauri::async_runtime::spawn_blocking(move || {
         let check = || {
             if cancelled.load(Ordering::SeqCst) {
@@ -422,13 +424,21 @@ async fn capture_single_thumbnail(
         let quality = quality.clamp(2, 12).to_string();
         let decoder_threads = decoder_threads.clamp(1, 4).to_string();
         let scale_filter = format!("scale={width}:-2");
-        let build_args = |precise: bool, output_path: &str| {
+        let target_seconds = time
+            .parse::<f64>()
+            .map_err(|error| format!("Invalid thumbnail timestamp '{time}': {error}"))?;
+        let build_args = |mode: &str, output_path: &str| {
             let mut args = vec!["-y".to_string()];
             if hardware_acceleration {
                 args.extend(["-hwaccel".to_string(), "auto".to_string()]);
             }
-            if !precise {
+            if mode == "fast" {
                 args.extend(["-ss".to_string(), time.clone()]);
+            } else if mode == "hybrid" {
+                args.extend([
+                    "-ss".to_string(),
+                    (target_seconds - 30.0).max(0.0).to_string(),
+                ]);
             }
             args.extend([
                 "-threads".to_string(),
@@ -436,8 +446,13 @@ async fn capture_single_thumbnail(
                 "-i".to_string(),
                 video_path.clone(),
             ]);
-            if precise {
+            if mode == "full" {
                 args.extend(["-ss".to_string(), time.clone()]);
+            } else if mode == "hybrid" {
+                args.extend([
+                    "-ss".to_string(),
+                    target_seconds.min(30.0).to_string(),
+                ]);
             }
             args.extend([
                 "-vframes".to_string(),
@@ -459,7 +474,8 @@ async fn capture_single_thumbnail(
         // cannot produce a usable file. Both attempts drain output continuously and have a hard
         // timeout, so a bad timestamp cannot leave the frontend stuck forever.
         let prefer_precise = seek_mode == "precise";
-        let fast_args = build_args(prefer_precise, &fast_path_string);
+        let primary_mode = if prefer_precise { "hybrid" } else { "fast" };
+        let fast_args = build_args(primary_mode, &fast_path_string);
         let fast_started = std::time::Instant::now();
         let fast_output = spawn_hidden(&executable)
             .args(&fast_args)
@@ -470,7 +486,7 @@ async fn capture_single_thumbnail(
             .and_then(|child| {
                 run_controlled(
                     child,
-                    deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(20)),
+                    deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(45)),
                     &cancelled,
                 )
             });
@@ -490,19 +506,14 @@ async fn capture_single_thumbnail(
             // Do not leave a zero-byte/invalid fast output around while the fallback runs.
             let _ = std::fs::remove_file(&fast_path);
             check().map_err(|error| format!("{error}\n{}", debug.join("\n")))?;
-            if prefer_precise {
-                return Err(format!(
-                    "Precise thumbnail capture at {time} failed.\n{}",
-                    debug.join("\n"),
-                ));
-            }
             if matches!(&fast_output, Err(error) if error.contains("cleanup exceeded") || error.contains("stop result: Err")) {
                 return Err(format!("Thumbnail process could not be cleaned up; retry stopped.\n{}", debug.join("\n")));
             }
             let precise_path = cache_dir.join(format!("thumbnail_{index}_{timestamp}_precise.jpg"));
             let precise_path_string = precise_path.to_string_lossy().to_string();
-            let precise_args = build_args(true, &precise_path_string);
-            // Both attempts share the same 30-second deadline; fallback gets only what remains.
+            let fallback_mode = if prefer_precise { "full" } else { "hybrid" };
+            let precise_args = build_args(fallback_mode, &precise_path_string);
+            // Both attempts share the same 90-second deadline; fallback gets only what remains.
             let precise_started = std::time::Instant::now();
             let precise_output = spawn_hidden(&executable)
                 .args(&precise_args)
@@ -514,7 +525,7 @@ async fn capture_single_thumbnail(
             let precise_ok = matches!(&precise_output, Ok(output) if output.status.success())
                 && captured_ok(&precise_path);
             debug.push(thumbnail_attempt_debug(
-                "precise",
+                if prefer_precise { "full-precise-fallback" } else { "hybrid-precise-fallback" },
                 precise_started.elapsed(),
                 &precise_output,
                 &precise_path,
@@ -523,7 +534,7 @@ async fn capture_single_thumbnail(
             if !precise_ok {
                 let _ = std::fs::remove_file(&precise_path);
                 return Err(format!(
-                    "Thumbnail capture at {time} failed (fast + precise seek).\n{}",
+                    "Thumbnail capture at {time} failed ({primary_mode} + {fallback_mode} seek).\n{}",
                     debug.join("\n"),
                 ));
             }

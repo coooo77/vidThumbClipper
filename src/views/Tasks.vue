@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useRouter } from 'vue-router'
@@ -17,12 +17,27 @@ const expandedTaskIds = ref<string[]>([])
 const safetyWarning = ref('')
 const clockNow = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | null = null
+const scheduleMode = ref<'now' | 'delay' | 'datetime'>('now')
+const delayHours = ref(0)
+const delayMinutes = ref(30)
+const scheduledDateTime = ref('')
+const scheduledStartAt = ref<number | null>(null)
+const scheduledNow = ref(Date.now())
+let scheduleTimer: ReturnType<typeof setInterval> | null = null
 const hasPendingTasks = computed(() => videoTasks.some((task) => task.status === '等待中'))
 const router = useRouter()
 
 onMounted(() => {
   ffmpegPath.value = localStorage.getItem('vid_ffmpeg_path') || ''
   ffprobePath.value = localStorage.getItem('vid_ffprobe_path') || ''
+  const storedSchedule = Number(localStorage.getItem('vid_task_schedule_at'))
+  scheduledStartAt.value = Number.isFinite(storedSchedule) && storedSchedule > 0 ? storedSchedule : null
+  scheduledDateTime.value = toLocalDateTimeInput(Date.now() + 60 * 60 * 1000)
+  startScheduleTimer()
+})
+onUnmounted(() => {
+  if (clockTimer) clearInterval(clockTimer)
+  if (scheduleTimer) clearInterval(scheduleTimer)
 })
 function folderOf(path: string) {
   return path.slice(0, Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/')) + 1)
@@ -77,6 +92,60 @@ function formatDuration(seconds: number) {
   if (hours) return `${hours} 小時 ${minutes} 分`
   if (minutes) return `${minutes} 分 ${remainingSeconds} 秒`
   return `${remainingSeconds} 秒`
+}
+function toLocalDateTimeInput(timestamp: number) {
+  const date = new Date(timestamp)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+function scheduleCountdownText() {
+  if (!scheduledStartAt.value) return ''
+  const seconds = Math.max(0, Math.ceil((scheduledStartAt.value - scheduledNow.value) / 1000))
+  return `${new Date(scheduledStartAt.value).toLocaleString()}（剩餘 ${formatDuration(seconds)}）`
+}
+function clearSchedule() {
+  scheduledStartAt.value = null
+  localStorage.removeItem('vid_task_schedule_at')
+}
+function startScheduleTimer() {
+  if (scheduleTimer) clearInterval(scheduleTimer)
+  const tick = () => {
+    scheduledNow.value = Date.now()
+    if (scheduledStartAt.value && scheduledStartAt.value <= scheduledNow.value && !running.value) {
+      clearSchedule()
+      void runTasks()
+    }
+  }
+  tick()
+  scheduleTimer = setInterval(tick, 1000)
+}
+function requestTaskRun() {
+  if (scheduleMode.value === 'now') {
+    clearSchedule()
+    void runTasks()
+    return
+  }
+  let startAt = 0
+  if (scheduleMode.value === 'delay') {
+    const hours = Math.max(0, Number(delayHours.value) || 0)
+    const minutes = Math.max(0, Number(delayMinutes.value) || 0)
+    const delayMs = (hours * 60 + minutes) * 60 * 1000
+    if (delayMs < 1000) {
+      safetyWarning.value = '請輸入至少 1 分鐘的延後時間。'
+      return
+    }
+    startAt = Date.now() + delayMs
+  } else {
+    startAt = new Date(scheduledDateTime.value).getTime()
+    if (!Number.isFinite(startAt) || startAt <= Date.now()) {
+      safetyWarning.value = '指定時間必須晚於現在，並可精確到秒。'
+      return
+    }
+  }
+  safetyWarning.value = ''
+  scheduledStartAt.value = startAt
+  localStorage.setItem('vid_task_schedule_at', String(startAt))
+  startScheduleTimer()
 }
 function startTaskProgress(task: VideoTask, total: number, label: string) {
   task.progress = { completed: 0, total: Math.max(1, total), startedAt: Date.now(), label }
@@ -369,7 +438,8 @@ async function runTasks() {
         <div class="task-actions">
           <button class="btn btn-secondary" @click="clearFinishedTasks">清除已完成</button
           ><button v-if="running" class="btn btn-danger" @click="requestStopCurrentTask">停止執行中的任務</button
-          ><button class="btn btn-primary" :disabled="running || !hasPendingTasks" @click="runTasks">{{ running ? '處理中…' : '開始依序執行' }}</button>
+          ><button v-if="scheduledStartAt" class="btn btn-secondary" @click="clearSchedule">取消排程</button
+          ><button class="btn btn-primary" :disabled="running || !hasPendingTasks || Boolean(scheduledStartAt)" @click="requestTaskRun">{{ running ? '處理中…' : scheduledStartAt ? '已排程' : scheduleMode === 'now' ? '開始依序執行' : '設定執行時間' }}</button>
         </div>
       </div>
       <div v-if="showStopConfirm" class="stop-confirm">
@@ -381,6 +451,21 @@ async function runTasks() {
       </div>
       <p class="info">任務會依建立順序執行。原始影片只會被讀取，絕不覆寫。</p>
       <div v-if="safetyWarning" class="safety-warning">{{ safetyWarning }}</div>
+      <div class="schedule-panel">
+        <div class="schedule-modes">
+          <label><input v-model="scheduleMode" type="radio" value="now" :disabled="Boolean(scheduledStartAt)" /> 立即執行</label>
+          <label><input v-model="scheduleMode" type="radio" value="delay" :disabled="Boolean(scheduledStartAt)" /> 延後執行</label>
+          <label><input v-model="scheduleMode" type="radio" value="datetime" :disabled="Boolean(scheduledStartAt)" /> 指定日期時間</label>
+        </div>
+        <div v-if="!scheduledStartAt && scheduleMode === 'delay'" class="schedule-fields">
+          <label>小時 <input v-model.number="delayHours" type="number" min="0" step="1" /></label>
+          <label>分鐘 <input v-model.number="delayMinutes" type="number" min="0" step="1" /></label>
+        </div>
+        <div v-else-if="!scheduledStartAt && scheduleMode === 'datetime'" class="schedule-fields">
+          <label>開始時間 <input v-model="scheduledDateTime" type="datetime-local" step="1" /></label>
+        </div>
+        <div v-if="scheduledStartAt" class="scheduled-summary"><strong>已排程</strong><span>{{ scheduleCountdownText() }}</span><small>程式需保持開啟；若電腦休眠，喚醒後會立即補執行。</small></div>
+      </div>
       <div class="input-group">
         <label>輸出位置（留空則輸出到原始影片所在資料夾）</label>
         <div class="input-with-btn">
@@ -498,6 +583,48 @@ async function runTasks() {
   color: #fcd34d;
   font-size: 0.86rem;
   line-height: 1.5;
+}
+.schedule-panel {
+  margin-bottom: 1rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 9px;
+  background: rgba(15, 23, 42, 0.34);
+}
+.schedule-modes,
+.schedule-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.8rem 1.1rem;
+}
+.schedule-modes label,
+.schedule-fields label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-muted);
+  font-size: 0.83rem;
+}
+.schedule-fields {
+  margin-top: 0.75rem;
+}
+.schedule-fields input {
+  width: auto;
+  min-width: 5.5rem;
+  padding: 0.45rem 0.6rem;
+}
+.scheduled-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem 0.7rem;
+  color: #c7d2fe;
+  font-size: 0.85rem;
+}
+.scheduled-summary small {
+  width: 100%;
+  color: var(--text-muted);
 }
 .task-row {
   display: flex;

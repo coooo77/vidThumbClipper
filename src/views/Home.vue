@@ -19,6 +19,7 @@ import {
 } from '../taskStore'
 import { clearWorkspaceDraft, loadWorkspaceDraft, saveWorkspaceDraft } from '../workspaceStore'
 import { directoryOf as dirName, formatTimecode as formatSeconds } from '../videoUtils'
+import { getThumbnailSettings, settingsForPreset, type ThumbnailPreset, type ThumbnailSeekMode } from '../thumbnailSettings'
 
 interface ThumbnailItem {
   time: number
@@ -59,6 +60,14 @@ const filmstripVisible = ref(true)
 const logs = ref<string[]>([])
 const progressText = ref('')
 const progressPercent = ref(0)
+const thumbnailPreset = ref<ThumbnailPreset>('balanced')
+const thumbnailWidth = ref(480)
+const thumbnailQuality = ref(5)
+const thumbnailSeekMode = ref<ThumbnailSeekMode>('precise')
+const thumbnailDecoderThreads = ref(2)
+const thumbnailConcurrency = ref<1 | 2>(1)
+const thumbnailHardwareAcceleration = ref(false)
+const showAdvancedCaptureSettings = ref(false)
 const workspaceRecovered = ref(false)
 let workspaceReady = false
 let workspaceSaveTimer: ReturnType<typeof setTimeout> | null = null
@@ -314,6 +323,24 @@ function loadPaths() {
   ffmpegPath.value = localStorage.getItem('vid_ffmpeg_path') || ''
   ffprobePath.value = localStorage.getItem('vid_ffprobe_path') || ''
   taskNameSuffix.value = localStorage.getItem('vid_task_suffix') || '_edit'
+  const thumbnail = getThumbnailSettings()
+  thumbnailPreset.value = thumbnail.preset
+  thumbnailWidth.value = thumbnail.width
+  thumbnailQuality.value = thumbnail.quality
+  thumbnailSeekMode.value = thumbnail.seekMode
+  thumbnailDecoderThreads.value = thumbnail.decoderThreads
+  thumbnailConcurrency.value = thumbnail.concurrency
+  thumbnailHardwareAcceleration.value = thumbnail.hardwareAcceleration
+}
+
+function applyThumbnailPreset() {
+  const settings = settingsForPreset(thumbnailPreset.value)
+  thumbnailWidth.value = settings.width
+  thumbnailQuality.value = settings.quality
+  thumbnailSeekMode.value = settings.seekMode
+  thumbnailDecoderThreads.value = settings.decoderThreads
+  thumbnailConcurrency.value = settings.concurrency
+  thumbnailHardwareAcceleration.value = settings.hardwareAcceleration
 }
 
 function restoreSavedWorkspace() {
@@ -485,6 +512,7 @@ onMounted(async () => {
 // Home is kept alive between routes. A task edit request takes priority; otherwise returning to
 // this page restores the ordinary load/source view.
 onActivated(() => {
+  loadPaths()
   const taskId = takeTaskEditRequest()
   if (taskId) void restoreTaskForEditing(taskId)
   else selectVideoFilePanel()
@@ -820,61 +848,82 @@ async function deleteAllProcessedVideos() {
   }
 }
 
-let activeThumbnailRequest: string | null = null
+const activeThumbnailRequests = new Set<string>()
 
 async function captureThumbnail(args: Record<string, unknown>, shouldStop?: () => boolean) {
   const requestId = newTaskId()
   await invoke('begin_thumbnail', { requestId })
   try {
     if (shouldStop?.()) throw new Error('Thumbnail cancelled')
-    if (shouldStop) activeThumbnailRequest = requestId
-    return await invoke<string>('capture_single_thumbnail', { ...args, requestId })
+    if (shouldStop) activeThumbnailRequests.add(requestId)
+    const captureArgs = {
+      ...args,
+      requestId,
+      width: thumbnailWidth.value,
+      quality: thumbnailQuality.value,
+      seekMode: thumbnailSeekMode.value,
+      decoderThreads: thumbnailDecoderThreads.value,
+      hardwareAcceleration: thumbnailHardwareAcceleration.value,
+    }
+    try {
+      return await invoke<string>('capture_single_thumbnail', captureArgs)
+    } catch (error) {
+      if (!thumbnailHardwareAcceleration.value) throw error
+      addLog('硬體解碼無法完成此張縮圖，已自動改用軟體解碼。')
+      return await invoke<string>('capture_single_thumbnail', { ...captureArgs, hardwareAcceleration: false })
+    }
   } finally {
-    if (activeThumbnailRequest === requestId) activeThumbnailRequest = null
+    activeThumbnailRequests.delete(requestId)
     await invoke('end_thumbnail', { requestId })
   }
 }
 
 function stopActiveThumbnail() {
-  if (activeThumbnailRequest) {
-    void invoke('cancel_thumbnail', { requestId: activeThumbnailRequest })
+  for (const requestId of activeThumbnailRequests) {
+    void invoke('cancel_thumbnail', { requestId })
       .catch((error) => addLog(`無法傳送取消要求：${String(error)}`))
   }
 }
 
 async function captureAtTimes(times: number[], offset: number, shouldStop?: () => boolean, onCaptured?: (item: ThumbnailItem, index: number) => void) {
   const result: ThumbnailItem[] = []
-  for (let i = 0; i < times.length; i += 1) {
-    if (shouldStop && shouldStop()) break
-    // Do not show 100% until the awaited backend capture has actually returned. Previously the
-    // last item displayed "40/40 (100%)" while ffmpeg could still be blocked, which made it look
-    // safe to start an expansion even though isProcessing was still true.
-    progressPercent.value = Math.round((i / times.length) * 100)
-    progressText.value = `正在擷取 ${i + 1}/${times.length} 張（${progressPercent.value}%）`
-    let base64: string
-    try {
-      base64 = await captureThumbnail({
-        ffmpegPath: ffmpegPath.value || null,
-        videoPath: videoPath.value,
-        time: times[i].toFixed(3),
-        index: offset + i,
-      }, shouldStop)
-    } catch (error) {
-      if (shouldStop?.()) {
-        if (String(error).includes('cleanup') || String(error).includes('stop result: Err')) {
-          addLog(`取消後程序清理異常：${String(error)}`)
+  let nextIndex = 0
+  let completed = 0
+  let firstError: unknown = null
+  const worker = async () => {
+    while (!firstError) {
+      if (shouldStop?.()) return
+      const index = nextIndex
+      nextIndex += 1
+      if (index >= times.length) return
+      progressText.value = `正在擷取 ${completed + 1}/${times.length} 張（${progressPercent.value}%）`
+      try {
+        const base64 = await captureThumbnail({
+          ffmpegPath: ffmpegPath.value || null,
+          videoPath: videoPath.value,
+          time: times[index].toFixed(3),
+          index: offset + index,
+        }, shouldStop)
+        const item = { time: times[index], timeStr: formatSeconds(times[index]), base64: `data:image/jpeg;base64,${base64}` }
+        result.push(item)
+        onCaptured?.(item, index)
+        completed += 1
+        progressPercent.value = Math.round((completed / times.length) * 100)
+        progressText.value = `已完成擷取 ${completed}/${times.length} 張（${progressPercent.value}%）`
+      } catch (error) {
+        if (shouldStop?.()) {
+          if (String(error).includes('cleanup') || String(error).includes('stop result: Err')) addLog(`取消後程序清理異常：${String(error)}`)
+          return
         }
-        break
+        if (!firstError) firstError = error
+        stopActiveThumbnail()
       }
-      throw error
     }
-    const item = { time: times[i], timeStr: formatSeconds(times[i]), base64: `data:image/jpeg;base64,${base64}` }
-    result.push(item)
-    onCaptured?.(item, i)
-    progressPercent.value = Math.round(((i + 1) / times.length) * 100)
-    progressText.value = `已完成擷取 ${i + 1}/${times.length} 張（${progressPercent.value}%）`
   }
-  return result
+  const workerCount = Math.min(thumbnailConcurrency.value, Math.max(1, times.length))
+  await Promise.all(Array.from({ length: workerCount }, worker))
+  if (firstError) throw firstError
+  return result.sort((a, b) => a.time - b.time)
 }
 
 async function generateGridThumbnails() {
@@ -1545,6 +1594,29 @@ function createCombineTask() {
 
         <div v-if="loadSubPanel !== 'source'" class="load-panel-capture-area">
           <div v-if="loadSubPanel === 'init'" class="subsection capture-section">
+          <div class="input-group capture-quality-field">
+            <label>縮圖品質</label>
+            <select v-model="thumbnailPreset" @change="applyThumbnailPreset">
+              <option value="fast">快速</option>
+              <option value="balanced">平衡</option>
+              <option value="high">高品質</option>
+            </select>
+          </div>
+          <button type="button" class="advanced-capture-toggle" @click="showAdvancedCaptureSettings = !showAdvancedCaptureSettings">
+            {{ showAdvancedCaptureSettings ? '收合進階截圖設定 ▴' : '進階截圖設定 ▾' }}
+          </button>
+          <div v-if="showAdvancedCaptureSettings" class="advanced-capture-settings">
+            <div class="row">
+              <div class="col input-group"><label>寬度（px）</label><input v-model.number="thumbnailWidth" type="number" min="160" max="1920" step="40" /></div>
+              <div class="col input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" type="number" min="2" max="12" /></div>
+            </div>
+            <div class="row">
+              <div class="col input-group"><label>定位模式</label><select v-model="thumbnailSeekMode"><option value="precise">精確（預設）</option><option value="fast">快速</option></select></div>
+              <div class="col input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
+            </div>
+            <div class="input-group"><label>解碼執行緒（1–4）</label><input v-model.number="thumbnailDecoderThreads" type="number" min="1" max="4" /></div>
+            <label class="checkbox-row"><input v-model="thumbnailHardwareAcceleration" type="checkbox" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>
+          </div>
           <div class="mode-row">
             <label><input v-model="initialCaptureMode" type="radio" value="grid" /> 依欄列等分</label>
             <label><input v-model="initialCaptureMode" type="radio" value="interval" /> 指定截圖間隔</label>
@@ -2573,6 +2645,31 @@ select:focus {
   place-items: center;
   color: var(--text-muted);
   border: 1px dashed var(--border-color);
+}
+.capture-quality-field select,
+.advanced-capture-settings select {
+  width: 100%;
+  padding: 0.65rem 0.7rem;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.6);
+  color: var(--text-color);
+}
+.advanced-capture-toggle {
+  width: 100%;
+  margin: -0.45rem 0 0.85rem;
+  border: 0;
+  background: none;
+  color: #a5b4fc;
+  text-align: left;
+  cursor: pointer;
+}
+.advanced-capture-settings {
+  margin-bottom: 1rem;
+  padding: 0.85rem;
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  border-radius: 9px;
+  background: rgba(99, 102, 241, 0.06);
 }
 .workspace-recovery {
   display: flex;

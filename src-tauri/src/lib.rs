@@ -380,6 +380,11 @@ async fn capture_single_thumbnail(
     video_path: String,
     time: String,
     index: i64,
+    width: u32,
+    quality: u8,
+    seek_mode: String,
+    decoder_threads: u8,
+    hardware_acceleration: bool,
 ) -> Result<String, String> {
     let cancelled = runs
         .lock()
@@ -413,29 +418,51 @@ async fn capture_single_thumbnail(
             path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false)
         };
         let mut debug = Vec::new();
+        let width = width.clamp(160, 1920).to_string();
+        let quality = quality.clamp(2, 12).to_string();
+        let decoder_threads = decoder_threads.clamp(1, 4).to_string();
+        let scale_filter = format!("scale={width}:-2");
+        let build_args = |precise: bool, output_path: &str| {
+            let mut args = vec!["-y".to_string()];
+            if hardware_acceleration {
+                args.extend(["-hwaccel".to_string(), "auto".to_string()]);
+            }
+            if !precise {
+                args.extend(["-ss".to_string(), time.clone()]);
+            }
+            args.extend([
+                "-threads".to_string(),
+                decoder_threads.clone(),
+                "-i".to_string(),
+                video_path.clone(),
+            ]);
+            if precise {
+                args.extend(["-ss".to_string(), time.clone()]);
+            }
+            args.extend([
+                "-vframes".to_string(),
+                "1".to_string(),
+                "-vf".to_string(),
+                scale_filter.clone(),
+                "-q:v".to_string(),
+                quality.clone(),
+                "-pix_fmt".to_string(),
+                "yuvj420p".to_string(),
+                "-strict".to_string(),
+                "unofficial".to_string(),
+                output_path.to_string(),
+            ]);
+            args
+        };
 
-        // Fast seek is preferred; precise seek is used only when fast seek did not produce a usable
-        // file. Both attempts drain their output continuously and have a hard timeout, so a bad
-        // timestamp cannot leave the frontend's processing state stuck forever.
-        let fast_args = [
-            "-y",
-            "-ss",
-            &time,
-            "-i",
-            &video_path,
-            "-vframes",
-            "1",
-            "-q:v",
-            "5",
-            "-pix_fmt",
-            "yuvj420p",
-            "-strict",
-            "unofficial",
-            &fast_path_string,
-        ];
+        // The selected seek mode is attempted first. Fast mode falls back to precise mode when it
+        // cannot produce a usable file. Both attempts drain output continuously and have a hard
+        // timeout, so a bad timestamp cannot leave the frontend stuck forever.
+        let prefer_precise = seek_mode == "precise";
+        let fast_args = build_args(prefer_precise, &fast_path_string);
         let fast_started = std::time::Instant::now();
         let fast_output = spawn_hidden(&executable)
-            .args(fast_args)
+            .args(&fast_args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -450,7 +477,7 @@ async fn capture_single_thumbnail(
         let fast_ok = matches!(&fast_output, Ok(output) if output.status.success())
             && captured_ok(&fast_path);
         debug.push(thumbnail_attempt_debug(
-            "fast",
+            if prefer_precise { "precise-primary" } else { "fast" },
             fast_started.elapsed(),
             &fast_output,
             &fast_path,
@@ -463,31 +490,22 @@ async fn capture_single_thumbnail(
             // Do not leave a zero-byte/invalid fast output around while the fallback runs.
             let _ = std::fs::remove_file(&fast_path);
             check().map_err(|error| format!("{error}\n{}", debug.join("\n")))?;
+            if prefer_precise {
+                return Err(format!(
+                    "Precise thumbnail capture at {time} failed.\n{}",
+                    debug.join("\n"),
+                ));
+            }
             if matches!(&fast_output, Err(error) if error.contains("cleanup exceeded") || error.contains("stop result: Err")) {
                 return Err(format!("Thumbnail process could not be cleaned up; retry stopped.\n{}", debug.join("\n")));
             }
             let precise_path = cache_dir.join(format!("thumbnail_{index}_{timestamp}_precise.jpg"));
             let precise_path_string = precise_path.to_string_lossy().to_string();
-            let precise_args = [
-                "-y",
-                "-i",
-                &video_path,
-                "-ss",
-                &time,
-                "-vframes",
-                "1",
-                "-q:v",
-                "5",
-                "-pix_fmt",
-                "yuvj420p",
-                "-strict",
-                "unofficial",
-                &precise_path_string,
-            ];
+            let precise_args = build_args(true, &precise_path_string);
             // Both attempts share the same 30-second deadline; fallback gets only what remains.
             let precise_started = std::time::Instant::now();
             let precise_output = spawn_hidden(&executable)
-                .args(precise_args)
+                .args(&precise_args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -541,7 +559,7 @@ fn thumbnail_attempt_debug(
     elapsed: std::time::Duration,
     output: &Result<std::process::Output, String>,
     path: &std::path::Path,
-    args: &[&str],
+    args: &[String],
 ) -> String {
     let file_info = match path.metadata() {
         Ok(metadata) => format!(

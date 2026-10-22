@@ -4,6 +4,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { openPath } from '@tauri-apps/plugin-opener'
 import { invoke } from '@tauri-apps/api/core'
 import { getNotifySettings, playCompletionSound, playFailureSound, saveNotifySettings, type NotifyTrigger } from '../notify'
+import { getThumbnailSettings, saveThumbnailSettings, settingsForPreset, type ThumbnailPreset, type ThumbnailSeekMode } from '../thumbnailSettings'
 
 const ffmpegPath = ref('')
 const ffprobePath = ref('')
@@ -15,6 +16,13 @@ const notifyTrigger = ref<NotifyTrigger>('batch')
 const notifyOnFailure = ref(true)
 const diskSafetyEnabled = ref(false)
 const diskSafetyMinGb = ref(100)
+const thumbnailPreset = ref<ThumbnailPreset>('balanced')
+const thumbnailWidth = ref(480)
+const thumbnailQuality = ref(5)
+const thumbnailSeekMode = ref<ThumbnailSeekMode>('precise')
+const thumbnailDecoderThreads = ref(2)
+const thumbnailConcurrency = ref<1 | 2>(1)
+const thumbnailHardwareAcceleration = ref(false)
 
 onMounted(() => {
   ffmpegPath.value = localStorage.getItem('vid_ffmpeg_path') || ''
@@ -27,6 +35,14 @@ onMounted(() => {
   notifyOnFailure.value = notify.onFailure
   diskSafetyEnabled.value = localStorage.getItem('vid_disk_safety_enabled') === 'true'
   diskSafetyMinGb.value = Math.max(1, Number(localStorage.getItem('vid_disk_safety_min_gb')) || 100)
+  const thumbnail = getThumbnailSettings()
+  thumbnailPreset.value = thumbnail.preset
+  thumbnailWidth.value = thumbnail.width
+  thumbnailQuality.value = thumbnail.quality
+  thumbnailSeekMode.value = thumbnail.seekMode
+  thumbnailDecoderThreads.value = thumbnail.decoderThreads
+  thumbnailConcurrency.value = thumbnail.concurrency
+  thumbnailHardwareAcceleration.value = thumbnail.hardwareAcceleration
 })
 
 function showStatus(message: string) {
@@ -42,7 +58,26 @@ function saveSettings() {
   saveNotifySettings({ enabled: notifyEnabled.value, volume: notifyVolume.value, trigger: notifyTrigger.value, onFailure: notifyOnFailure.value })
   localStorage.setItem('vid_disk_safety_enabled', String(diskSafetyEnabled.value))
   localStorage.setItem('vid_disk_safety_min_gb', String(Math.max(1, Number(diskSafetyMinGb.value) || 100)))
+  saveThumbnailSettings({
+    preset: thumbnailPreset.value,
+    width: thumbnailWidth.value,
+    quality: thumbnailQuality.value,
+    seekMode: thumbnailSeekMode.value,
+    decoderThreads: thumbnailDecoderThreads.value,
+    concurrency: thumbnailConcurrency.value,
+    hardwareAcceleration: thumbnailHardwareAcceleration.value,
+  })
   showStatus('設定已儲存。')
+}
+function applyThumbnailPreset() {
+  const settings = settingsForPreset(thumbnailPreset.value)
+  thumbnailWidth.value = settings.width
+  thumbnailQuality.value = settings.quality
+  thumbnailSeekMode.value = settings.seekMode
+  thumbnailDecoderThreads.value = settings.decoderThreads
+  thumbnailConcurrency.value = settings.concurrency
+  thumbnailHardwareAcceleration.value = settings.hardwareAcceleration
+  saveSettings()
 }
 function testCompletionSound() {
   playCompletionSound(notifyVolume.value)
@@ -114,6 +149,27 @@ async function clearThumbnailCache() {
           ><span v-if="statusMsg" class="status-badge">{{ statusMsg }}</span></transition
         >
       </div>
+    </section>
+
+    <section class="card settings-card">
+      <h2 class="card-title">縮圖擷取預設</h2>
+      <p class="description">首頁每次開啟時會套用這組預設。降低寬度通常比單純降低 JPEG 畫質更能提升速度與減少記憶體。</p>
+      <div class="input-group">
+        <label>品質方案</label>
+        <select v-model="thumbnailPreset" @change="applyThumbnailPreset">
+          <option value="fast">快速（320px、最多同時 2 張）</option>
+          <option value="balanced">平衡（480px、低負載）</option>
+          <option value="high">高品質（720px、精確定位）</option>
+        </select>
+      </div>
+      <div class="thumbnail-default-grid">
+        <div class="input-group"><label>縮圖寬度</label><input v-model.number="thumbnailWidth" type="number" min="160" max="1920" step="40" @change="saveSettings" /></div>
+        <div class="input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" type="number" min="2" max="12" @change="saveSettings" /></div>
+        <div class="input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" @change="saveSettings"><option value="fast">快速</option><option value="precise">精確</option></select></div>
+        <div class="input-group"><label>解碼執行緒</label><input v-model.number="thumbnailDecoderThreads" type="number" min="1" max="4" @change="saveSettings" /></div>
+        <div class="input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency" @change="saveSettings"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
+      </div>
+      <label class="checkbox-row-label"><input v-model="thumbnailHardwareAcceleration" type="checkbox" @change="saveSettings" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>
     </section>
 
     <section class="card settings-card">
@@ -219,6 +275,20 @@ async function clearThumbnailCache() {
 .disk-safety-settings {
   padding: 1rem 1.1rem 0;
   border-left: 2px solid var(--border-color);
+}
+.thumbnail-default-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 1rem;
+}
+.thumbnail-default-grid select,
+.settings-card > .input-group select {
+  width: 100%;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.6);
+  color: var(--text-color);
 }
 .notify-sub-settings .mode-row {
   display: flex;

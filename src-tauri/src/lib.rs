@@ -40,11 +40,23 @@ fn end_thumbnail(request_id: String, runs: tauri::State<ThumbnailRuns>) -> Resul
 
 use base64::{engine::general_purpose, Engine as _};
 
-// Tracks the PID of whichever long-running ffmpeg process (clip/merge/combine — not the quick
-// thumbnail/duration calls) is currently in flight, so a "stop task" request from the frontend has
-// something to actually kill. Only one video-processing task runs at a time (Tasks.vue's queue is
-// sequential), so a single slot is enough — no need for a full task-id-keyed registry.
-type RunningPid = Arc<Mutex<Option<u32>>>;
+// Tracks whichever long-running ffmpeg process (clip/merge/combine — not the quick
+// thumbnail/duration calls) is currently in flight. The cancellation token is authoritative: an
+// OS-level kill can race with a process exiting successfully, so the caller must still receive a
+// cancellation error whenever a stop request reached the tracked process before it was cleared.
+#[derive(Clone)]
+struct RunningProcess {
+    pid: u32,
+    cancel_token: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct RunningProcessTracker {
+    current: Option<RunningProcess>,
+    batch_cancel_requested: bool,
+}
+
+type RunningProcessState = Arc<Mutex<RunningProcessTracker>>;
 
 fn thumbnail_cache_dir() -> Result<PathBuf, String> {
     let directory = std::env::temp_dir()
@@ -70,22 +82,10 @@ fn spawn_hidden(executable: &str) -> Command {
     command
 }
 
-// Runs a spawned child to completion with a hard time limit. stdout/stderr are drained on
-// dedicated threads the whole time (not just after exit) — reading them only after the process
-// ends risks the OS pipe buffer filling up and the child blocking on its own write(), which would
-// turn "wait for exit" into its own indefinite hang. If the timeout elapses, the child is killed
-// so the caller is guaranteed a result either way instead of hanging forever.
-fn run_with_timeout(
-    child: std::process::Child,
-    timeout: std::time::Duration,
-) -> Result<std::process::Output, String> {
-    run_controlled(
-        child,
-        std::time::Instant::now() + timeout,
-        &AtomicBool::new(false),
-    )
-}
-
+// Runs a spawned child to completion with a hard deadline and cancellation token. stdout/stderr
+// are drained on dedicated threads the whole time (not just after exit) — reading them only after
+// the process ends risks the OS pipe buffer filling up and the child blocking on its own write(),
+// which would turn "wait for exit" into its own indefinite hang.
 fn run_controlled(
     mut child: std::process::Child,
     deadline: std::time::Instant,
@@ -110,7 +110,7 @@ fn run_controlled(
 
     let outcome = loop {
         if cancelled.load(Ordering::SeqCst) {
-            break Err("Thumbnail cancelled".to_string());
+            break Err("Process cancelled".to_string());
         }
         if std::time::Instant::now() >= deadline {
             break Err("Process timed out: deadline exceeded".to_string());
@@ -158,12 +158,119 @@ fn run_controlled(
     })
 }
 
-#[tauri::command]
-fn cancel_current_task(running: tauri::State<RunningPid>) -> Result<bool, String> {
-    let pid = *running
+fn finish_tracked_process<T>(
+    running: &RunningProcessState,
+    pid: u32,
+    cancel_token: &Arc<AtomicBool>,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    let mut guard = running
         .lock()
-        .map_err(|_| "State lock poisoned".to_string())?;
-    let Some(pid) = pid else { return Ok(false) };
+        .map_err(|_| "Process state lock poisoned".to_string())?;
+    let is_current = guard.current.as_ref().is_some_and(|process| {
+        process.pid == pid && Arc::ptr_eq(&process.cancel_token, cancel_token)
+    });
+    let was_cancelled = guard.batch_cancel_requested || cancel_token.load(Ordering::SeqCst);
+    if is_current {
+        guard.current = None;
+    }
+    drop(guard);
+
+    if was_cancelled {
+        match result {
+            Err(error) if error.contains("Process cancelled") => Err(error),
+            _ => Err("Process cancelled".to_string()),
+        }
+    } else {
+        result
+    }
+}
+
+fn run_tracked_process(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+    running: &RunningProcessState,
+) -> Result<std::process::Output, String> {
+    let pid = child.id();
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    {
+        let mut guard = match running.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Process state lock poisoned".to_string());
+            }
+        };
+        if guard.batch_cancel_requested {
+            drop(guard);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Process cancelled".to_string());
+        }
+        if guard.current.is_some() {
+            drop(guard);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Another video process is already running".to_string());
+        }
+        guard.current = Some(RunningProcess {
+            pid,
+            cancel_token: cancel_token.clone(),
+        });
+    }
+
+    let result = run_controlled(child, std::time::Instant::now() + timeout, &cancel_token);
+    finish_tracked_process(running, pid, &cancel_token, result)
+}
+
+fn request_tracked_process_cancel(running: &RunningProcessState) -> Result<Option<u32>, String> {
+    let mut guard = running
+        .lock()
+        .map_err(|_| "Process state lock poisoned".to_string())?;
+    guard.batch_cancel_requested = true;
+    let Some(process) = guard.current.as_ref() else {
+        return Ok(None);
+    };
+    // Set the token while holding the state lock. Process completion takes the same lock before
+    // clearing the slot, which gives cancellation a deterministic ordering against normal exit.
+    process.cancel_token.store(true, Ordering::SeqCst);
+    Ok(Some(process.pid))
+}
+
+fn reset_task_batch_cancel(running: &RunningProcessState) -> Result<(), String> {
+    let mut guard = running
+        .lock()
+        .map_err(|_| "Process state lock poisoned".to_string())?;
+    if guard.current.is_some() {
+        return Err("Cannot begin a new task batch while a video process is running".to_string());
+    }
+    guard.batch_cancel_requested = false;
+    Ok(())
+}
+
+fn task_batch_cancelled(running: &RunningProcessState) -> Result<bool, String> {
+    running
+        .lock()
+        .map(|state| state.batch_cancel_requested)
+        .map_err(|_| "Process state lock poisoned".to_string())
+}
+
+#[tauri::command]
+fn begin_task_batch(running: tauri::State<RunningProcessState>) -> Result<(), String> {
+    reset_task_batch_cancel(&running)
+}
+
+#[tauri::command]
+fn is_task_batch_cancelled(running: tauri::State<RunningProcessState>) -> Result<bool, String> {
+    task_batch_cancelled(&running)
+}
+
+#[tauri::command]
+fn cancel_current_task(running: tauri::State<RunningProcessState>) -> Result<bool, String> {
+    let Some(pid) = request_tracked_process_cancel(&running)? else {
+        return Ok(false);
+    };
     #[cfg(target_os = "windows")]
     {
         let _ = spawn_hidden("taskkill")
@@ -318,7 +425,7 @@ fn get_available_space(path: String) -> Result<u64, String> {
 async fn run_ffmpeg(
     ffmpeg_path: Option<String>,
     args: Vec<String>,
-    running: tauri::State<'_, RunningPid>,
+    running: tauri::State<'_, RunningProcessState>,
 ) -> Result<String, String> {
     let running = running.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -331,15 +438,7 @@ async fn run_ffmpeg(
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| format!("Unable to run ffmpeg: {error}"))?;
-        let pid = child.id();
-        if let Ok(mut guard) = running.lock() {
-            *guard = Some(pid);
-        }
-        let output = run_with_timeout(child, std::time::Duration::from_secs(3600));
-        if let Ok(mut guard) = running.lock() {
-            *guard = None;
-        }
-        let output = output?;
+        let output = run_tracked_process(child, std::time::Duration::from_secs(3600), &running)?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         if output.status.success() {
@@ -624,7 +723,7 @@ async fn concat_videos(
     output_path: String,
     extra_args: Vec<String>,
     delete_inputs: bool,
-    running: tauri::State<'_, RunningPid>,
+    running: tauri::State<'_, RunningProcessState>,
 ) -> Result<(), String> {
     let running = running.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -669,15 +768,7 @@ async fn concat_videos(
             .spawn()
             .map_err(|error| format!("Unable to run ffmpeg: {error}"));
         let output = child.and_then(|child| {
-            let pid = child.id();
-            if let Ok(mut guard) = running.lock() {
-                *guard = Some(pid);
-            }
-            let result = run_with_timeout(child, std::time::Duration::from_secs(3600));
-            if let Ok(mut guard) = running.lock() {
-                *guard = None;
-            }
-            result
+            run_tracked_process(child, std::time::Duration::from_secs(3600), &running)
         });
         let _ = std::fs::remove_file(list_path);
         let output = output?;
@@ -702,7 +793,7 @@ async fn concat_videos(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(Arc::new(Mutex::new(None::<u32>)) as RunningPid)
+        .manage(Arc::new(Mutex::new(RunningProcessTracker::default())) as RunningProcessState)
         .manage(ThumbnailRuns::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -720,6 +811,8 @@ pub fn run() {
             export_debug_log,
             get_available_space,
             concat_videos,
+            begin_task_batch,
+            is_task_batch_cancelled,
             cancel_current_task
         ])
         .run(tauri::generate_context!())
@@ -745,6 +838,10 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap()
+    }
+
+    fn running_process_state() -> RunningProcessState {
+        Arc::new(Mutex::new(RunningProcessTracker::default()))
     }
 
     #[test]
@@ -775,9 +872,101 @@ mod tests {
         });
         let error = run_controlled(child, started + Duration::from_secs(8), &cancel).unwrap_err();
         setter.join().unwrap();
-        assert!(error.contains("cancelled"), "{error}");
+        assert!(error.contains("Process cancelled"), "{error}");
         assert!(error.contains("stop result: Ok"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn tracked_process_cancellation_interrupts_and_clears_child() {
+        let running = running_process_state();
+        let signal_state = running.clone();
+        let started = Instant::now();
+        let setter = std::thread::spawn(move || {
+            loop {
+                if signal_state.lock().unwrap().current.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(request_tracked_process_cancel(&signal_state)
+                .expect("state should remain usable")
+                .is_some());
+        });
+
+        let error = run_tracked_process(fixture("sleep"), Duration::from_secs(8), &running)
+            .expect_err("the tracked cancellation must be returned as an error");
+        setter.join().unwrap();
+
+        assert!(error.contains("Process cancelled"), "{error}");
+        let state = running.lock().unwrap();
+        assert!(state.current.is_none());
+        assert!(state.batch_cancel_requested);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn tracked_cancellation_wins_over_successful_result() {
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        let running: RunningProcessState = Arc::new(Mutex::new(RunningProcessTracker {
+            current: Some(RunningProcess {
+                pid: 42,
+                cancel_token: cancel_token.clone(),
+            }),
+            batch_cancel_requested: false,
+        }));
+
+        assert_eq!(request_tracked_process_cancel(&running).unwrap(), Some(42));
+        let error = finish_tracked_process(&running, 42, &cancel_token, Ok::<_, String>(()))
+            .expect_err("a successful process exit must not hide an accepted cancellation");
+
+        assert_eq!(error, "Process cancelled");
+        let state = running.lock().unwrap();
+        assert!(state.current.is_none());
+        assert!(state.batch_cancel_requested);
+    }
+
+    #[test]
+    fn cancellation_without_current_process_rejects_next_child() {
+        let running = running_process_state();
+        assert_eq!(request_tracked_process_cancel(&running).unwrap(), None);
+        assert!(task_batch_cancelled(&running).unwrap());
+
+        let started = Instant::now();
+        let error = run_tracked_process(fixture("sleep"), Duration::from_secs(8), &running)
+            .expect_err("the latched batch cancellation must reject the next child");
+
+        assert_eq!(error, "Process cancelled");
+        let state = running.lock().unwrap();
+        assert!(state.current.is_none());
+        assert!(state.batch_cancel_requested);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn beginning_new_batch_resets_latched_cancellation_only_when_idle() {
+        let running = running_process_state();
+        assert_eq!(request_tracked_process_cancel(&running).unwrap(), None);
+        assert!(task_batch_cancelled(&running).unwrap());
+        reset_task_batch_cancel(&running).unwrap();
+        assert!(!task_batch_cancelled(&running).unwrap());
+
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = running.lock().unwrap();
+            state.current = Some(RunningProcess {
+                pid: 84,
+                cancel_token,
+            });
+            state.batch_cancel_requested = true;
+        }
+        let error = reset_task_batch_cancel(&running)
+            .expect_err("an active process must prevent a batch reset");
+        assert!(
+            error.contains("while a video process is running"),
+            "{error}"
+        );
+        assert!(running.lock().unwrap().batch_cancel_requested);
     }
 
     #[test]

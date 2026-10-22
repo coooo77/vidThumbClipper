@@ -11,8 +11,8 @@ const ffmpegPath = ref('')
 const ffprobePath = ref('')
 const outputDirectory = ref(localStorage.getItem('vid_output_directory') || '')
 const running = ref(false)
+const stopBatchRequested = ref(false)
 const showStopConfirm = ref(false)
-const pendingCancelTaskId = ref<string | null>(null)
 const pendingEditTaskId = ref<string | null>(null)
 const expandedTaskIds = ref<string[]>([])
 const draggedTaskId = ref<string | null>(null)
@@ -317,40 +317,39 @@ async function chooseOutputDirectory() {
     localStorage.setItem('vid_output_directory', selected)
   }
 }
-function requestStopCurrentTask() {
-  const current = videoTasks.find((task) => task.status === '處理中')
-  if (current) requestStopTask(current)
+function requestStopBatch() {
+  if (!running.value || stopBatchRequested.value) return
+  showStopConfirm.value = true
 }
 function requestStopTask(task: VideoTask) {
-  if (task.status !== '處理中') return
-  pendingCancelTaskId.value = task.id
+  if (task.status !== '處理中' || stopBatchRequested.value) return
   showStopConfirm.value = true
 }
 function cancelStopConfirm() {
   showStopConfirm.value = false
-  pendingCancelTaskId.value = null
 }
-async function confirmStopCurrentTask() {
+async function confirmStopBatch() {
   showStopConfirm.value = false
-  const taskId = pendingCancelTaskId.value
-  const current = videoTasks.find((task) => task.id === taskId && task.status === '處理中')
+  stopBatchRequested.value = true
+  const current = videoTasks.find((task) => task.status === '處理中')
   if (!current) {
-    pendingCancelTaskId.value = null
+    if (!running.value) stopBatchRequested.value = false
     return
   }
+  current.message = '正在停止目前任務；後續任務會保留在等待佇列。'
   try {
-    const processWasRunning = await invoke<boolean>('cancel_current_task')
-    if (!processWasRunning) {
-      // After restarting the app, the persisted task may still say "處理中" even
-      // though this app instance no longer owns the ffmpeg process.
-      current.status = '已取消'
-      current.message = '此任務已停止；若輸出資料夾中留下不完整檔案，請手動刪除。'
-      pendingCancelTaskId.value = null
-      if (!running.value) void runTasks()
-    }
-  } catch {
-    // The running task's own catch block in runTasks() handles the status update either way.
+    await invoke<boolean>('cancel_current_task')
+  } catch (error) {
+    safetyWarning.value = `停止要求暫時無法傳送；本批仍會在目前處理步驟結束後停止：${String(error)}`
   }
+}
+function retryTask(task: VideoTask) {
+  if (running.value || task.status === '等待中' || task.status === '處理中') return
+  task.status = '等待中'
+  task.message = ''
+  task.progress = undefined
+  task.resultPath = ''
+  if (pendingEditTaskId.value === task.id) pendingEditTaskId.value = null
 }
 function clearFinishedTasks() {
   for (let index = videoTasks.length - 1; index >= 0; index -= 1) {
@@ -365,11 +364,30 @@ async function chooseTaskOutputDirectory(task: VideoTask) {
 function clearTaskOutputDirectory(task: VideoTask) {
   task.outputDir = ''
 }
+function throwIfStopRequested(task: VideoTask) {
+  if (stopBatchRequested.value && task.status === '處理中') throw new Error('Task stopped by user')
+}
+function isProcessCancellation(error: unknown) {
+  return String(error).includes('Process cancelled')
+}
+async function throwIfBatchStopLatched(task: VideoTask) {
+  throwIfStopRequested(task)
+  try {
+    if (!(await invoke<boolean>('is_task_batch_cancelled'))) return
+  } catch {
+    // The local flag and tracked-process error still protect the normal path. A read failure here
+    // must not turn an otherwise successful video task into a false failure.
+    return
+  }
+  stopBatchRequested.value = true
+  throw new Error('Task stopped by user')
+}
 async function clipRange(task: VideoTask, range: VideoSegment, path: string) {
   const args = task.preciseSeek
     ? ['-i', task.source, '-ss', range.start.toFixed(3), '-to', range.end.toFixed(3), '-c', 'copy', path, '-y']
     : ['-ss', range.start.toFixed(3), '-i', task.source, '-to', range.end.toFixed(3), '-c', 'copy', path, '-y']
   const ffmpegOutput = await invoke<string>('run_ffmpeg', { ffmpegPath: ffmpegPath.value || null, args })
+  throwIfStopRequested(task)
   const expected = range.end - range.start
   // A truncated/broken copy can still end up with a container header that claims the requested
   // duration (get_video_duration reads that metadata, so it isn't reliable here) — actual file
@@ -391,33 +409,41 @@ async function clipRange(task: VideoTask, range: VideoSegment, path: string) {
 async function runPreprocessTask(task: VideoTask) {
   startTaskProgress(task, 1, '正在預先處理')
   const path = destination(task)
+  throwIfStopRequested(task)
   await invoke('run_ffmpeg', { ffmpegPath: ffmpegPath.value || null, args: ['-i', task.source, '-c', 'copy', path, '-y'] })
+  throwIfStopRequested(task)
   completeTaskStep(task, '預先處理完成')
   task.resultPath = path
 }
 async function runClipTask(task: VideoTask) {
+  throwIfStopRequested(task)
   const duration = task.method === 'range' || task.segments.length
     ? 0
     : await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: task.source })
+  throwIfStopRequested(task)
   const ranges = buildClipRanges(task, duration)
   startTaskProgress(task, ranges.length, `準備剪輯 ${ranges.length} 個片段`)
-  for (let index = 0; index < ranges.length; index += 1)
-    {
-      if (task.progress) task.progress.label = `正在剪輯片段 ${index + 1}/${ranges.length}`
-      await clipRange(task, ranges[index], destination(task, ranges.length > 1 ? `_${String(index + 1).padStart(3, '0')}` : ''))
-      completeTaskStep(task, `已完成片段 ${index + 1}/${ranges.length}`)
-    }
+  for (let index = 0; index < ranges.length; index += 1) {
+    throwIfStopRequested(task)
+    if (task.progress) task.progress.label = `正在剪輯片段 ${index + 1}/${ranges.length}`
+    await clipRange(task, ranges[index], destination(task, ranges.length > 1 ? `_${String(index + 1).padStart(3, '0')}` : ''))
+    throwIfStopRequested(task)
+    completeTaskStep(task, `已完成片段 ${index + 1}/${ranges.length}`)
+  }
 }
 async function runMergeTask(task: VideoTask) {
   startTaskProgress(task, task.segments.length + 1, `準備剪輯 ${task.segments.length} 個片段`)
   const clips: string[] = []
   for (let index = 0; index < task.segments.length; index += 1) {
+    throwIfStopRequested(task)
     if (task.progress) task.progress.label = `正在剪輯片段 ${index + 1}/${task.segments.length}`
     const path = destination(task, `_segment_${String(index + 1).padStart(3, '0')}`)
     await clipRange(task, task.segments[index], path)
+    throwIfStopRequested(task)
     clips.push(path)
     completeTaskStep(task, `已完成片段 ${index + 1}/${task.segments.length}`)
   }
+  throwIfStopRequested(task)
   if (task.progress) task.progress.label = '正在合併片段'
   await invoke('concat_videos', {
     ffmpegPath: ffmpegPath.value || null,
@@ -426,11 +452,13 @@ async function runMergeTask(task: VideoTask) {
     extraArgs: parseExtraArgs(task.extraArgs),
     deleteInputs: !task.keepSegments,
   })
+  throwIfStopRequested(task)
   completeTaskStep(task, '合併完成')
 }
 async function runCombineTask(task: VideoTask) {
   startTaskProgress(task, 1, '正在合併影片')
   const path = destination(task)
+  throwIfStopRequested(task)
   if (task.combineMode === 'copy') {
     await invoke('concat_videos', { ffmpegPath: ffmpegPath.value || null, files: task.combineSources, outputPath: path, extraArgs: [], deleteInputs: false })
   } else {
@@ -441,6 +469,7 @@ async function runCombineTask(task: VideoTask) {
     const args = [...inputArgs, '-filter_complex', filter, '-map', '[outv]', '-map', '[outa]', '-c:v', 'libx264', '-c:a', 'aac', path, '-y']
     await invoke('run_ffmpeg', { ffmpegPath: ffmpegPath.value || null, args })
   }
+  throwIfStopRequested(task)
   let sizeBytes = 0
   try {
     sizeBytes = await invoke<number>('get_file_size', { path })
@@ -458,17 +487,27 @@ async function runCombineTask(task: VideoTask) {
 async function runTasks() {
   if (running.value) return
   if (outputDirectory.value.trim()) localStorage.setItem('vid_output_directory', outputDirectory.value.trim())
+  stopBatchRequested.value = false
   running.value = true
-  clockTimer = setInterval(() => { clockNow.value = Date.now() }, 1000)
   safetyWarning.value = ''
+  try {
+    await invoke('begin_task_batch')
+  } catch (error) {
+    running.value = false
+    safetyWarning.value = `無法初始化任務佇列，因此沒有開始執行：${String(error)}`
+    return
+  }
+  clockTimer = setInterval(() => { clockNow.value = Date.now() }, 1000)
   const { trigger } = getNotifySettings()
   let processedAny = false
   let hadFailure = false
   try {
     for (;;) {
+      if (stopBatchRequested.value) break
       const task = videoTasks.find((item) => item.status === '等待中')
       if (!task) break
       if (!(await ensureEnoughDiskSpace(task))) break
+      if (stopBatchRequested.value) break
       processedAny = true
       task.status = '處理中'
       try {
@@ -476,14 +515,15 @@ async function runTasks() {
         else if (task.kind === 'merge') await runMergeTask(task)
         else if (task.kind === 'combine') await runCombineTask(task)
         else await runPreprocessTask(task)
+        await throwIfBatchStopLatched(task)
         task.status = '完成'
         task.message = `已輸出至 ${outputDirectory.value || directoryOf(task.source)}`
         if (trigger === 'each') notifyResult(true)
       } catch (error) {
-        if (pendingCancelTaskId.value === task.id) {
+        if (stopBatchRequested.value || isProcessCancellation(error)) {
+          stopBatchRequested.value = true
           task.status = '已取消'
-          task.message = '使用者已停止此任務，可能留下不完整的輸出檔案，需要手動清理。'
-          pendingCancelTaskId.value = null
+          task.message = '已停止此任務，後續任務仍保留等待。若留下不完整的輸出檔案，重新執行時會覆寫；也可以手動清理。'
         } else {
           task.status = '失敗'
           task.message = String(error)
@@ -491,12 +531,16 @@ async function runTasks() {
           if (trigger === 'each') notifyResult(false)
         }
       }
+      if (stopBatchRequested.value) break
     }
   } finally {
+    const wasStopped = stopBatchRequested.value
     running.value = false
     if (clockTimer) clearInterval(clockTimer)
     clockTimer = null
-    if (trigger === 'batch' && processedAny) notifyResult(!hadFailure)
+    showStopConfirm.value = false
+    stopBatchRequested.value = false
+    if (trigger === 'batch' && processedAny && !wasStopped) notifyResult(!hadFailure)
   }
 }
 </script>
@@ -508,16 +552,16 @@ async function runTasks() {
         <h2 class="card-title">影片處理任務</h2>
         <div class="task-actions">
           <button class="btn btn-secondary" @click="clearFinishedTasks">清除已完成</button
-          ><button v-if="running" class="btn btn-danger" @click="requestStopCurrentTask">停止執行中的任務</button
+          ><button v-if="running" class="btn btn-danger" :disabled="stopBatchRequested" @click="requestStopBatch">{{ stopBatchRequested ? '正在停止…' : '停止整批執行' }}</button
           ><button v-if="scheduledStartAt" class="btn btn-secondary" @click="clearSchedule">取消排程</button
           ><button class="btn btn-primary" :disabled="running || !hasPendingTasks || Boolean(scheduledStartAt)" @click="requestTaskRun">{{ running ? '處理中…' : scheduledStartAt ? '已排程' : scheduleMode === 'now' ? '開始依序執行' : '設定執行時間' }}</button>
         </div>
       </div>
       <div v-if="showStopConfirm" class="stop-confirm">
-        <span>確定要強制停止目前執行中的任務嗎？已經處理的部分可能留下不完整的輸出檔案，此動作無法復原。</span>
+        <span>確定要停止整批執行嗎？目前任務會標記為已取消，後續任務會保留在等待佇列；已經處理的部分可能留下不完整檔案。</span>
         <div class="stop-confirm-actions">
           <button class="btn btn-secondary compact" @click="cancelStopConfirm">取消</button
-          ><button class="btn btn-danger compact" @click="confirmStopCurrentTask">確定停止</button>
+          ><button class="btn btn-danger compact" @click="confirmStopBatch">確定停止整批</button>
         </div>
       </div>
       <p class="info">任務會依建立順序執行。原始影片只會被讀取，絕不覆寫。</p>
@@ -593,8 +637,14 @@ async function runTasks() {
                 class="task-control task-control-edit"
                 @click="requestEditTask(task)"
               >再編輯</button>
-              <button v-if="task.kind === 'preprocess' && task.status === '處理中'" class="btn btn-danger compact task-stop" @click="requestStopTask(task)">停止</button>
-              <button v-else-if="task.status !== '處理中'" class="task-control task-control-remove" @click="videoTasks.splice(index, 1)">移除</button>
+              <button
+                v-if="task.status === '完成' || task.status === '失敗' || task.status === '已取消'"
+                class="task-control task-control-retry"
+                :disabled="running"
+                @click="retryTask(task)"
+              >{{ task.status === '完成' ? '再次執行' : '重新執行' }}</button>
+              <button v-if="task.status === '處理中'" class="btn btn-danger compact task-stop" :disabled="stopBatchRequested" @click="requestStopTask(task)">{{ stopBatchRequested ? '停止中…' : '停止' }}</button>
+              <button v-else class="task-control task-control-remove" @click="videoTasks.splice(index, 1)">移除</button>
             </div>
           </div>
           <div v-if="pendingEditTaskId === task.id" class="edit-confirm">
@@ -893,6 +943,16 @@ async function runTasks() {
   border-color: rgba(165, 180, 252, 0.58);
   background: rgba(99, 102, 241, 0.38);
 }
+.task-control-retry {
+  border-color: rgba(52, 211, 153, 0.32);
+  background: rgba(6, 78, 59, 0.16);
+  color: #a7f3d0;
+}
+.task-control-retry:hover:not(:disabled) {
+  border-color: rgba(52, 211, 153, 0.56);
+  background: rgba(6, 95, 70, 0.32);
+  color: #d1fae5;
+}
 .task-control-remove {
   border-color: rgba(248, 113, 113, 0.2);
   background: rgba(127, 29, 29, 0.05);
@@ -906,6 +966,10 @@ async function runTasks() {
 .task-control:focus-visible {
   outline: 2px solid rgba(165, 180, 252, 0.75);
   outline-offset: 2px;
+}
+.task-control:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
 }
 .edit-confirm {
   display: flex;

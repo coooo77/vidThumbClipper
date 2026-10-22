@@ -183,7 +183,7 @@ async function clearThumbnailCache() {
         </div>
         <div class="input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" type="number" min="2" max="12" @change="saveSettings" /></div>
         <div class="input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" @change="saveSettings"><option value="fast">快速</option><option value="precise">精確</option></select></div>
-        <div class="input-group"><label>解碼執行緒</label><input v-model.number="thumbnailDecoderThreads" type="number" min="1" max="4" @change="saveSettings" /></div>
+        <div class="input-group"><label>解碼執行緒（0＝自動，1–4＝限制）</label><input v-model.number="thumbnailDecoderThreads" type="number" min="0" max="4" @change="saveSettings" /></div>
         <div class="input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency" @change="saveSettings"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
       </div>
       <label class="checkbox-row-label"><input v-model="thumbnailHardwareAcceleration" type="checkbox" @change="saveSettings" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>

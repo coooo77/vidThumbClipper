@@ -421,6 +421,12 @@ fn get_available_space(path: String) -> Result<u64, String> {
     available_space_for_path(trimmed)
 }
 
+fn append_decoder_thread_limit(args: &mut Vec<String>, decoder_threads: u8) {
+    if decoder_threads > 0 {
+        args.extend(["-threads".to_string(), decoder_threads.to_string()]);
+    }
+}
+
 #[tauri::command]
 async fn run_ffmpeg(
     ffmpeg_path: Option<String>,
@@ -538,7 +544,7 @@ async fn capture_single_thumbnail(
         let mut debug = Vec::new();
         let max_height = max_height.clamp(144, 2160);
         let quality = quality.clamp(2, 12).to_string();
-        let decoder_threads = decoder_threads.clamp(1, 4).to_string();
+        let decoder_threads = decoder_threads.clamp(0, 4);
         // Limit by height (the conventional meaning of 720p) and never enlarge a smaller source.
         // FFmpeg's expression comma must be escaped so it is not parsed as another filter.
         let scale_filter = format!("scale=-2:min({max_height}\\,ih)");
@@ -558,12 +564,10 @@ async fn capture_single_thumbnail(
                     (target_seconds - 30.0).max(0.0).to_string(),
                 ]);
             }
-            args.extend([
-                "-threads".to_string(),
-                decoder_threads.clone(),
-                "-i".to_string(),
-                video_path.clone(),
-            ]);
+            // Zero means FFmpeg decides the decoder thread count. This matches the original fast
+            // capture path and avoids throttling long H.264 transport streams to one or two cores.
+            append_decoder_thread_limit(&mut args, decoder_threads);
+            args.extend(["-i".to_string(), video_path.clone()]);
             if mode == "full" {
                 args.extend(["-ss".to_string(), time.clone()]);
             } else if mode == "hybrid" {
@@ -842,6 +846,20 @@ mod tests {
 
     fn running_process_state() -> RunningProcessState {
         Arc::new(Mutex::new(RunningProcessTracker::default()))
+    }
+
+    #[test]
+    fn automatic_decoder_threads_leave_ffmpeg_unrestricted() {
+        let mut args = Vec::new();
+        append_decoder_thread_limit(&mut args, 0);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn explicit_decoder_thread_limit_is_preserved() {
+        let mut args = Vec::new();
+        append_decoder_thread_limit(&mut args, 2);
+        assert_eq!(args, ["-threads", "2"]);
     }
 
     #[test]

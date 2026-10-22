@@ -1732,7 +1732,7 @@ function createCombineTask() {
               <div class="input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" :disabled="thumbnailSettingsLocked" type="number" min="2" max="12" /></div>
               <div class="input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" :disabled="thumbnailSettingsLocked"><option value="precise">精確（預設）</option><option value="fast">快速</option></select></div>
               <div class="input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency" :disabled="thumbnailSettingsLocked"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
-              <div class="input-group"><label>解碼執行緒（1–4）</label><input v-model.number="thumbnailDecoderThreads" :disabled="thumbnailSettingsLocked" type="number" min="1" max="4" /></div>
+              <div class="input-group"><label>解碼執行緒（0＝自動，1–4＝限制）</label><input v-model.number="thumbnailDecoderThreads" :disabled="thumbnailSettingsLocked" type="number" min="0" max="4" /></div>
               <label class="checkbox-row advanced-setting-checkbox"><input v-model="thumbnailHardwareAcceleration" :disabled="thumbnailSettingsLocked" type="checkbox" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>
             </div>
           </div>

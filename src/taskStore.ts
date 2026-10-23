@@ -12,7 +12,8 @@ export interface VideoSegment {
 export interface TaskPreviewTimeline {
   duration: number
   times: number[]
-  gridCols: number
+  /** @deprecated Kept only so timelines saved by older versions remain readable. */
+  gridCols?: number
 }
 export interface TaskProgress {
   completed: number

@@ -36,7 +36,7 @@ interface ThumbnailItem {
   base64: string
 }
 
-type ExpansionMode = 'interval' | 'single' | 'grid'
+type ExpansionMode = 'interval' | 'single' | 'count'
 type QueueStatus = '等待中' | '處理中' | '完成' | '失敗' | '已取消'
 type ModalImageSize = 'fit' | 'original'
 
@@ -47,8 +47,7 @@ interface ExpansionJob {
   mode: ExpansionMode
   interval: number
   singleAnchor: 'start' | 'end'
-  cols: number
-  rows: number
+  count: number
   label: string
   status: QueueStatus
   message: string
@@ -83,19 +82,15 @@ const workspaceRecovered = ref(false)
 let workspaceReady = false
 let workspaceSaveTimer: ReturnType<typeof setTimeout> | null = null
 
-// The visible layout is always editable. Rows are increased automatically when more images are inserted.
-const gridCols = ref(7)
-const gridRows = ref(5)
-const initialCaptureMode = ref<'grid' | 'interval'>('grid')
+const initialCaptureMode = ref<'count' | 'interval'>('count')
+const initialThumbnailCount = ref(33)
 const initialInterval = ref(4)
-const initialGridSlotCount = computed(() => Math.max(1, Math.floor(Number(gridCols.value) || 1) * Math.floor(Number(gridRows.value) || 1)))
-const initialThumbnailCount = computed(() => Math.max(0, initialGridSlotCount.value - 2))
 const intervalThumbnailCount = computed(() => {
   const interval = Number(initialInterval.value)
   if (!Number.isFinite(interval) || interval <= 0 || !Number.isFinite(videoDuration.value) || videoDuration.value <= 0) return 0
   return Math.max(0, Math.ceil((videoDuration.value - 0.0005) / interval) - 1)
 })
-const plannedThumbnailCount = computed(() => initialCaptureMode.value === 'grid' ? initialThumbnailCount.value : intervalThumbnailCount.value)
+const plannedThumbnailCount = computed(() => initialCaptureMode.value === 'count' ? Math.max(0, Math.floor(Number(initialThumbnailCount.value) || 0)) : intervalThumbnailCount.value)
 const thumbnails = ref<ThumbnailItem[]>([])
 const startThumbnail = ref<string | null>(null)
 const endThumbnail = ref<string | null>(null)
@@ -107,8 +102,7 @@ const selectedTimes = ref<number[]>([])
 const expansionMode = ref<ExpansionMode>('interval')
 const expansionInterval = ref(1)
 const singleInsertAnchor = ref<'start' | 'end'>('start')
-const expansionCols = ref(2)
-const expansionRows = ref(2)
+const expansionCount = ref(4)
 const expansionQueue = ref<ExpansionJob[]>([])
 const videoDuration = ref(0)
 const durationLoading = ref(false)
@@ -216,6 +210,7 @@ const gridRef = ref<HTMLElement | null>(null)
 const gridScrollTop = ref(0)
 const gridWidth = ref(0)
 const gridHeight = ref(0)
+const previewColumns = ref(4)
 let gridResizeObserver: ResizeObserver | null = null
 const gridSequence = computed(() => [
   ...(showStartEndpoint.value ? [{ time: 0, src: startThumbnail.value, label: '00:00:00', endpoint: true }] : []),
@@ -224,7 +219,7 @@ const gridSequence = computed(() => [
 ])
 const hasPreviewContent = computed(() => Boolean(thumbnails.value.length || startThumbnail.value || endThumbnail.value || isProcessing.value || isEndpointProcessing.value))
 const previewDisplayCount = computed(() => (hasPreviewContent.value ? gridSequence.value.length : 0))
-const gridColumnCount = computed(() => Math.max(1, Math.floor(Number(gridCols.value) || 1)))
+const gridColumnCount = computed(() => Math.max(1, Math.min(12, Math.floor(Number(previewColumns.value) || 4))))
 const gridRowPitch = computed(() => {
   const contentWidth = Math.max(1, gridWidth.value - 9)
   const itemWidth = Math.max(1, (contentWidth - (gridColumnCount.value - 1) * 3) / gridColumnCount.value)
@@ -324,7 +319,7 @@ watch(activeModalIndex, async (index) => {
 const newCaptureCount = computed(() => {
   if (expansionMode.value === 'interval') return Math.max(0, Math.ceil((endTime.value - startTime.value) / Math.max(1, expansionInterval.value)) - 1)
   if (expansionMode.value === 'single') return buildSingleInsertTime() === null ? 0 : 1
-  return Math.max(1, expansionCols.value) * Math.max(1, expansionRows.value)
+  return Math.max(1, Math.floor(Number(expansionCount.value) || 1))
 })
 
 // Used only by the adjacency-bound expansion feature below.
@@ -376,9 +371,13 @@ function restoreSavedWorkspace() {
   videoPath.value = draft.videoPath
   originalSourcePath.value = draft.originalSourcePath || draft.videoPath
   videoDuration.value = Math.max(0, Number(draft.videoDuration) || 0)
-  gridCols.value = Math.max(1, Math.floor(Number(draft.gridCols) || 1))
-  gridRows.value = Math.max(1, Math.floor(Number(draft.gridRows) || 1))
-  initialCaptureMode.value = draft.initialCaptureMode === 'interval' ? 'interval' : 'grid'
+  const legacyInitialCount = Math.max(0, Math.floor(Number(draft.gridCols) || 7) * Math.floor(Number(draft.gridRows) || 5) - 2)
+  const savedInitialCount = Number(draft.initialThumbnailCount)
+  initialThumbnailCount.value = Number.isFinite(savedInitialCount) && savedInitialCount >= 0
+    ? Math.floor(savedInitialCount)
+    : legacyInitialCount
+  initialCaptureMode.value = draft.initialCaptureMode === 'interval' ? 'interval' : 'count'
+  previewColumns.value = Math.max(1, Math.min(12, Math.floor(Number(draft.gridCols) || Number(localStorage.getItem('vid_preview_columns')) || 4)))
   initialInterval.value = Math.max(0.1, Number(draft.initialInterval) || 4)
   taskKind.value = draft.taskKind === 'merge' ? 'merge' : 'clip'
   taskMethod.value = ['range', 'duration', 'count'].includes(draft.taskMethod) ? draft.taskMethod : 'range'
@@ -400,7 +399,6 @@ function restoreSavedWorkspace() {
     .filter((time) => time > 0 && time < videoDuration.value)
     .map((time) => ({ time, timeStr: formatSeconds(time), base64: '' }))
   workspaceRecovered.value = times.length > 0
-  normaliseLayout()
   addLog(workspaceRecovered.value ? '已復原上次工作區；縮圖圖片尚未載入，可自行選擇何時重新建立。' : '已復原上次工作區設定。')
 }
 
@@ -420,9 +418,9 @@ function scheduleWorkspaceSave() {
       previewTimes,
       selectedTimes: [...selectedTimes.value],
       mergeSegments: mergeSegments.value.map((segment) => ({ ...segment })),
-      gridCols: gridCols.value,
-      gridRows: gridRows.value,
       initialCaptureMode: initialCaptureMode.value,
+      initialThumbnailCount: initialThumbnailCount.value,
+      gridCols: previewColumns.value,
       initialInterval: initialInterval.value,
       taskKind: taskKind.value,
       taskMethod: taskMethod.value,
@@ -438,7 +436,7 @@ function scheduleWorkspaceSave() {
 }
 
 watch([
-  videoPath, originalSourcePath, videoDuration, gridCols, gridRows, initialCaptureMode, initialInterval,
+  videoPath, originalSourcePath, videoDuration, initialCaptureMode, initialThumbnailCount, initialInterval, previewColumns,
   taskKind, taskMethod, taskDurationHours, taskSplitCount, taskOutputName, taskExtension, taskExtraArgs,
   taskPreciseSeek, taskKeepSegments, showStartEndpoint, showEndEndpoint,
   () => thumbnails.value.map((item) => item.time).join(','),
@@ -587,8 +585,8 @@ function debugLogContent() {
     preview: {
       totalSlots: gridSequence.value.length,
       loadedMiddleThumbnails: thumbnails.value.filter((item) => item.base64).length,
-      gridCols: gridCols.value,
-      gridRows: gridRows.value,
+      gridCols: previewColumns.value,
+      renderedColumns: gridColumnCount.value,
       selectedTimes: selectedTimes.value,
       processing: isProcessing.value || isEndpointProcessing.value || isExpanding.value,
     },
@@ -656,39 +654,22 @@ function modalGoNext() {
   activeModalIndex.value += 1
 }
 
-function normaliseLayout() {
-  gridCols.value = Math.max(1, Math.floor(gridCols.value || 1))
-  gridRows.value = Math.max(1, Math.ceil(gridSequence.value.length / gridCols.value))
+function persistPreviewColumns() {
+  previewColumns.value = Math.max(1, Math.min(12, Math.floor(Number(previewColumns.value) || 4)))
+  localStorage.setItem('vid_preview_columns', String(previewColumns.value))
+  nextTick(measureGrid)
 }
 
-function updateLayoutFromUser() {
-  gridCols.value = Math.max(1, Math.floor(gridCols.value || 1))
-  gridRows.value = Math.max(1, Math.floor(gridRows.value || 1))
-  localStorage.setItem('vid_grid_cols', String(gridCols.value))
-  localStorage.setItem('vid_grid_rows', String(gridRows.value))
-}
-
-// The user's last-chosen grid size should carry over to the next video's initial capture — only the
-// automatic row growth from "擴充兩張縮圖之間" should reset (that's handled separately per video).
-function loadGridPreference() {
-  const cols = Number(localStorage.getItem('vid_grid_cols'))
-  const rows = Number(localStorage.getItem('vid_grid_rows'))
-  gridCols.value = Number.isFinite(cols) && cols > 0 ? cols : 7
-  gridRows.value = Number.isFinite(rows) && rows > 0 ? rows : 5
-}
-
-function applyCurrentLayout() {
-  updateLayoutFromUser()
-  const minimumRows = Math.max(1, Math.ceil(gridSequence.value.length / gridCols.value))
-  if (gridRows.value < minimumRows) gridRows.value = minimumRows
-  addLog(`目前縮圖排列已設為 ${gridCols.value} × ${gridRows.value}。`)
+function loadPreviewColumnsPreference() {
+  const saved = Number(localStorage.getItem('vid_preview_columns'))
+  previewColumns.value = Number.isFinite(saved) ? Math.max(1, Math.min(12, Math.floor(saved))) : 4
 }
 
 function loadVideoFromPath(path: string) {
   loadPaths()
   videoPath.value = path
   originalSourcePath.value = path
-  loadGridPreference()
+  loadPreviewColumnsPreference()
   loadSubPanel.value = 'init'
   thumbnails.value = []
   startThumbnail.value = null
@@ -808,7 +789,7 @@ function useProcessedVideo(task: VideoTask) {
   loadPaths()
   videoPath.value = task.resultPath
   originalSourcePath.value = task.source
-  loadGridPreference()
+  loadPreviewColumnsPreference()
   loadSubPanel.value = 'init'
   thumbnails.value = []
   startThumbnail.value = null
@@ -1008,16 +989,13 @@ async function captureAtTimes(times: number[], offset: number, shouldStop?: () =
   return result
 }
 
-async function generateGridThumbnails() {
+async function generateInitialThumbnails() {
   if (!videoPath.value) return addLog('請先選擇影片檔案。')
   const interval = Number(initialInterval.value)
   if (initialCaptureMode.value === 'interval' && (!Number.isFinite(interval) || interval < 0.1)) {
     return addLog('請輸入至少 0.1 秒的有效截圖間隔。')
   }
-  updateLayoutFromUser()
-  // The selected N × M layout includes the two endpoint cells. Only the remaining cells need
-  // regular timeline captures; otherwise a 4 × 5 layout incorrectly renders 22 images.
-  const count = initialThumbnailCount.value
+  const count = Math.max(0, Math.floor(Number(initialThumbnailCount.value) || 0))
   loadPaths()
   isProcessing.value = true
   initialCaptureCancelRequested.value = false
@@ -1033,18 +1011,16 @@ async function generateGridThumbnails() {
   try {
     duration = await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: videoPath.value })
     videoDuration.value = duration
-    const actualCount = initialCaptureMode.value === 'grid' ? count : Math.max(0, Math.ceil((duration - 0.0005) / interval) - 1)
-    const times = Array.from({ length: actualCount }, (_, index) => initialCaptureMode.value === 'grid'
+    const actualCount = initialCaptureMode.value === 'count' ? count : Math.max(0, Math.ceil((duration - 0.0005) / interval) - 1)
+    const times = Array.from({ length: actualCount }, (_, index) => initialCaptureMode.value === 'count'
       ? ((index + 1) * duration) / (actualCount + 1)
       : (index + 1) * interval)
     thumbnails.value = times.map((time) => ({ time, timeStr: formatSeconds(time), base64: '' }))
-    normaliseLayout()
     await captureAtTimes(times, 0, () => initialCaptureCancelRequested.value, (item) => {
       const target = thumbnails.value.find((thumbnail) => thumbnail.time === item.time)
       if (target) target.base64 = item.base64
     })
     thumbnails.value = thumbnails.value.filter((item) => item.base64)
-    normaliseLayout()
     if (initialCaptureCancelRequested.value) {
       addLog(`已取消建立初始縮圖，已保留取消前完成的 ${thumbnails.value.length} 張縮圖。`)
     } else {
@@ -1148,7 +1124,6 @@ function removeSelectedPreviewRange() {
   activeModalIndex.value = null
   gridScrollTop.value = 0
   if (gridRef.value) gridRef.value.scrollTop = 0
-  normaliseLayout()
   addLog(`已移除 ${formatSeconds(start)} → ${formatSeconds(end)} 範圍內共 ${removedCount} 張縮圖（包含兩端）。`)
 }
 
@@ -1202,7 +1177,7 @@ async function restoreTaskForEditing(taskId: string) {
     showStartEndpoint.value = true
     showEndEndpoint.value = true
     videoDuration.value = 0
-    loadGridPreference()
+    loadPreviewColumnsPreference()
     activePanel.value = 'load'
     loadSubPanel.value = 'init'
     addLog('這筆舊任務沒有保存縮圖時間軸；請重新建立縮圖後再修改任務。')
@@ -1211,13 +1186,12 @@ async function restoreTaskForEditing(taskId: string) {
   }
 
   videoDuration.value = timeline.duration
-  gridCols.value = Math.max(1, Math.floor(timeline.gridCols || 1))
+  previewColumns.value = Math.max(1, Math.min(12, Math.floor(timeline.gridCols || 4)))
   const times = [...new Set(timeline.times.map(roundPreviewTime))].sort((a, b) => a - b)
   showStartEndpoint.value = times.some((time) => time === 0)
   showEndEndpoint.value = times.some((time) => Math.abs(time - timeline.duration) <= 0.0005)
   const middleTimes = times.filter((time) => time > 0 && time < timeline.duration)
   thumbnails.value = middleTimes.map((time) => ({ time, timeStr: formatSeconds(time), base64: '' }))
-  normaliseLayout()
   activePanel.value = 'load'
   loadSubPanel.value = 'init'
   isProcessing.value = true
@@ -1231,7 +1205,6 @@ async function restoreTaskForEditing(taskId: string) {
     })
     thumbnails.value = thumbnails.value.filter((item) => item.base64)
     completed = !initialCaptureCancelRequested.value
-    normaliseLayout()
     if (completed) addLog(`已恢復 ${thumbnails.value.length} 張中間縮圖，可繼續調整任務。`)
     else addLog(`已取消恢復縮圖，保留已完成的 ${thumbnails.value.length} 張。`)
   } catch (error) {
@@ -1278,7 +1251,7 @@ function buildTimesForJob(job: ExpansionJob): number[] {
     const time = job.singleAnchor === 'start' ? start + interval : end - interval
     return time > start && time < end ? [time] : []
   }
-  const count = Math.max(1, Math.floor(job.cols || 1)) * Math.max(1, Math.floor(job.rows || 1))
+  const count = Math.max(1, Math.floor(job.count || 1))
   const gap = (end - start) / (count + 1)
   return Array.from({ length: count }, (_, index) => start + gap * (index + 1))
 }
@@ -1311,8 +1284,7 @@ function queueExpansionJob() {
     mode: expansionMode.value,
     interval: expansionInterval.value,
     singleAnchor: singleInsertAnchor.value,
-    cols: expansionCols.value,
-    rows: expansionRows.value,
+    count: expansionCount.value,
     label: `${formatSeconds(start)} → ${formatSeconds(end)}`,
     status: '等待中',
     message: '',
@@ -1327,7 +1299,6 @@ function queueExpansionJob() {
     0,
     ...job.times.map((time) => ({ time, timeStr: formatSeconds(time), base64: '' })),
   )
-  normaliseLayout()
   expansionQueue.value.push(job)
   selectedTimes.value = []
   addLog(`已加入截圖任務：${job.label}`)
@@ -1344,7 +1315,6 @@ function removeExpansionJob(id: string) {
 function removeUnfinishedExpansionPlaceholders(job: ExpansionJob) {
   const timeSet = new Set(job.times)
   thumbnails.value = thumbnails.value.filter((item) => item.base64 || !timeSet.has(item.time))
-  normaliseLayout()
 }
 
 // Stop the current backend capture as well as subsequent frames; completed frames stay visible.
@@ -1403,11 +1373,10 @@ async function runExpansionJob(job: ExpansionJob) {
   if (job.cancelRequested) {
     removeUnfinishedExpansionPlaceholders(job)
   }
-  normaliseLayout()
   if (job.cancelRequested) {
     addLog(`已取消「${job.label}」，已插入取消前完成的 ${additions.length} 張縮圖。`)
   } else {
-    addLog(`已在「${job.label}」之間插入 ${additions.length} 張新縮圖，版面已自動調整為 ${gridCols.value} × ${gridRows.value}。`)
+    addLog(`已在「${job.label}」之間插入 ${additions.length} 張新縮圖。`)
   }
 }
 
@@ -1476,7 +1445,7 @@ function buildPreviewTimeline(): TaskPreviewTimeline | undefined {
   return {
     duration: roundPreviewTime(videoDuration.value),
     times,
-    gridCols: Math.max(1, Math.floor(gridCols.value || 1)),
+    gridCols: previewColumns.value,
   }
 }
 
@@ -1730,17 +1699,16 @@ function createCombineTask() {
             </div>
           </div>
           <div class="mode-row">
-            <label><input v-model="initialCaptureMode" type="radio" value="grid" /> 依欄列等分</label>
+            <label><input v-model="initialCaptureMode" type="radio" value="count" /> 指定張數</label>
             <label><input v-model="initialCaptureMode" type="radio" value="interval" /> 指定截圖間隔</label>
           </div>
-          <div v-if="initialCaptureMode === 'grid'" class="row">
-            <div class="col input-group"><label>欄（N）</label><input v-model.number="gridCols" type="number" min="1" @change="updateLayoutFromUser" /></div>
-            <div class="col input-group"><label>列（M）</label><input v-model.number="gridRows" type="number" min="1" @change="updateLayoutFromUser" /></div>
+          <div v-if="initialCaptureMode === 'count'" class="input-group">
+            <label>中間縮圖張數</label><input v-model.number="initialThumbnailCount" type="number" min="0" step="1" />
           </div>
           <div v-else class="input-group">
             <label>每隔幾秒擷取一張</label><input v-model.number="initialInterval" type="number" min="0.1" step="0.1" />
           </div>
-          <p v-if="initialCaptureMode === 'grid'" class="info-text">初始擷取 {{ initialThumbnailCount }} 張中間縮圖，連同起點與終點共 {{ initialGridSlotCount }} 格；之後可隨時自行改為任意 N × M 排列。</p>
+          <p v-if="initialCaptureMode === 'count'" class="info-text">將影片等分擷取 {{ plannedThumbnailCount }} 張中間縮圖，連同開頭與結尾共 {{ plannedThumbnailCount + 2 }} 張。</p>
           <p v-else class="info-text">
             {{ durationLoadFailed ? '無法預先讀取影片長度；請確認影片與 ffprobe 設定。' : durationLoading || !videoDuration ? '正在讀取影片長度，以計算縮圖張數…' : `影片長度 ${formatSeconds(videoDuration)}；預計擷取 ${plannedThumbnailCount} 張中間縮圖，加上起點與終點共 ${plannedThumbnailCount + 2} 格。` }}
           </p>
@@ -1753,7 +1721,7 @@ function createCombineTask() {
           >
             {{ initialCaptureCancelRequested ? '取消中…' : '取消建立縮圖' }}
           </button>
-          <button v-else class="btn btn-primary btn-glow w-full" :disabled="isEndpointProcessing || isExpanding" @click="generateGridThumbnails">
+          <button v-else class="btn btn-primary btn-glow w-full" :disabled="isEndpointProcessing || isExpanding" @click="generateInitialThumbnails">
             建立縮圖
           </button>
         </div>
@@ -1763,7 +1731,7 @@ function createCombineTask() {
           <div class="mode-row">
             <label><input v-model="expansionMode" type="radio" value="interval" /> 固定秒數</label
             ><label><input v-model="expansionMode" type="radio" value="single" /> 插入單張</label
-            ><label><input v-model="expansionMode" type="radio" value="grid" /> 等分 Grid</label>
+            ><label><input v-model="expansionMode" type="radio" value="count" /> 指定張數</label>
           </div>
           <div v-if="expansionMode === 'interval' || expansionMode === 'single'" class="input-group">
             <label>秒數（至少 1 秒）</label><input v-model.number="expansionInterval" type="number" min="1" />
@@ -1782,9 +1750,8 @@ function createCombineTask() {
             <label><input v-model="singleInsertAnchor" type="radio" value="start" /> 從起點（左側縮圖）往後 {{ expansionInterval }} 秒</label
             ><label><input v-model="singleInsertAnchor" type="radio" value="end" /> 從終點（右側縮圖）往前 {{ expansionInterval }} 秒</label>
           </div>
-          <div v-if="expansionMode === 'grid'" class="row">
-            <div class="col input-group"><label>Grid 欄（N）</label><input v-model.number="expansionCols" type="number" min="1" /></div>
-            <div class="col input-group"><label>Grid 列（M）</label><input v-model.number="expansionRows" type="number" min="1" /></div>
+          <div v-if="expansionMode === 'count'" class="input-group">
+            <label>在範圍內等距插入幾張</label><input v-model.number="expansionCount" type="number" min="1" step="1" />
           </div>
           <p v-if="selectedPair" class="selection-summary" :class="{ muted: isPairLocked }">
             範圍：{{ formatSeconds(startTime) }} → {{ formatSeconds(endTime) }}，預計插入 {{ newCaptureCount }} 張{{
@@ -1960,11 +1927,9 @@ function createCombineTask() {
           <h2 class="card-title">縮圖列表（{{ previewDisplayCount }} 張）</h2>
         </div>
         <div v-if="hasPreviewContent" class="current-layout-controls">
-          <span>目前顯示排列</span>
-          <label>欄 N <input v-model.number="gridCols" type="number" min="1" /></label>
-          <span>×</span>
-          <label>列 M <input v-model.number="gridRows" type="number" min="1" /></label>
-          <button class="btn btn-primary compact" @click="applyCurrentLayout">套用排列</button>
+          <label>每列欄數
+            <input v-model.number="previewColumns" class="preview-column-input" type="number" min="1" max="12" step="1" @change="persistPreviewColumns" />
+          </label>
           <template v-if="selectedTimeRange">
             <span class="row-divider">|</span>
             <span>已選擇範圍：{{ formatSeconds(selectedTimeRange.start) }} → {{ formatSeconds(selectedTimeRange.end) }}</span>
@@ -1972,7 +1937,7 @@ function createCombineTask() {
             <button v-if="taskKind === 'merge'" class="btn btn-primary compact" @click="addSegmentToMergeList">＋ 加入合併清單</button>
           </template>
         </div>
-        <p class="info-text">點一下選取，點兩下檢視原圖。選取任意兩張後可移除範圍內所有縮圖；擴充後會自動增加列數。</p>
+        <p class="info-text">點一下選取，點兩下檢視原圖。縮圖會依可用寬度自動排列；選取任意兩張後可移除範圍內所有縮圖。</p>
         <div v-if="workspaceRecovered" class="workspace-recovery">
           <div><strong>已復原上次工作區</strong><span>時間軸位置已保留，但縮圖圖片不會占用硬碟；可在方便時重新擷取。</span></div>
           <div class="workspace-recovery-actions">
@@ -2806,6 +2771,10 @@ select:focus {
   width: 4.5rem;
   padding: 0.35rem 0.45rem;
   font-size: 0.85rem;
+}
+.current-layout-controls .preview-column-input {
+  width: 5rem;
+  font-variant-numeric: tabular-nums;
 }
 .row-divider {
   opacity: 0.4;

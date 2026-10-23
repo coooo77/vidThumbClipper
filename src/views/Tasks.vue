@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useRouter } from 'vue-router'
 import { queueTaskEdit, videoTasks, type VideoSegment, type VideoTask } from '../taskStore'
@@ -160,6 +160,27 @@ function completeTaskStep(task: VideoTask, label: string) {
   if (!task.progress) return
   task.progress.completed = Math.min(task.progress.total, task.progress.completed + 1)
   task.progress.label = label
+}
+function updateMediaProgress(task: VideoTask, completedBefore: number, expectedDuration: number, processedSeconds: number) {
+  if (!task.progress || task.status !== '處理中') return
+  const bounded = Math.min(Math.max(0, expectedDuration), Math.max(0, processedSeconds))
+  task.progress.completed = Math.min(task.progress.total, completedBefore + bounded)
+}
+async function runFfmpegWithProgress(task: VideoTask, args: string[], completedBefore: number, expectedDuration: number) {
+  const onProgress = new Channel<number>()
+  onProgress.onmessage = (seconds) => updateMediaProgress(task, completedBefore, expectedDuration, seconds)
+  const result = await invoke<string>('run_ffmpeg', { ffmpegPath: ffmpegPath.value || null, args, onProgress })
+  updateMediaProgress(task, completedBefore, expectedDuration, expectedDuration)
+  return result
+}
+async function concatWithProgress(task: VideoTask, files: string[], outputPath: string, extraArgs: string[], deleteInputs: boolean, completedBefore: number, expectedDuration: number) {
+  const onProgress = new Channel<number>()
+  onProgress.onmessage = (seconds) => updateMediaProgress(task, completedBefore, expectedDuration, seconds)
+  await invoke('concat_videos', { ffmpegPath: ffmpegPath.value || null, files, outputPath, extraArgs, deleteInputs, onProgress })
+  updateMediaProgress(task, completedBefore, expectedDuration, expectedDuration)
+}
+async function videoDuration(path: string) {
+  return await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: path })
 }
 function taskProgressPercent(task: VideoTask) {
   if (!task.progress?.total) return 0
@@ -373,11 +394,11 @@ async function throwIfBatchStopLatched(task: VideoTask) {
   stopBatchRequested.value = true
   throw new Error('Task stopped by user')
 }
-async function clipRange(task: VideoTask, range: VideoSegment, path: string) {
+async function clipRange(task: VideoTask, range: VideoSegment, path: string, completedBefore: number) {
   const args = task.preciseSeek
     ? ['-i', task.source, '-ss', range.start.toFixed(3), '-to', range.end.toFixed(3), '-c', 'copy', path, '-y']
     : ['-ss', range.start.toFixed(3), '-i', task.source, '-to', range.end.toFixed(3), '-c', 'copy', path, '-y']
-  const ffmpegOutput = await invoke<string>('run_ffmpeg', { ffmpegPath: ffmpegPath.value || null, args })
+  const ffmpegOutput = await runFfmpegWithProgress(task, args, completedBefore, Math.max(0.001, range.end - range.start))
   throwIfStopRequested(task)
   const expected = range.end - range.start
   // A truncated/broken copy can still end up with a container header that claims the requested
@@ -398,10 +419,11 @@ async function clipRange(task: VideoTask, range: VideoSegment, path: string) {
   }
 }
 async function runPreprocessTask(task: VideoTask) {
-  startTaskProgress(task, 1, '正在預先處理')
+  const duration = Math.max(0.001, await videoDuration(task.source))
+  startTaskProgress(task, duration, '正在預先處理')
   const path = destination(task)
   throwIfStopRequested(task)
-  await invoke('run_ffmpeg', { ffmpegPath: ffmpegPath.value || null, args: ['-i', task.source, '-c', 'copy', path, '-y'] })
+  await runFfmpegWithProgress(task, ['-i', task.source, '-c', 'copy', path, '-y'], 0, duration)
   throwIfStopRequested(task)
   completeTaskStep(task, '預先處理完成')
   task.resultPath = path
@@ -413,52 +435,62 @@ async function runClipTask(task: VideoTask) {
     : await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: task.source })
   throwIfStopRequested(task)
   const ranges = buildClipRanges(task, duration)
-  startTaskProgress(task, ranges.length, `準備剪輯 ${ranges.length} 個片段`)
+  const totalDuration = Math.max(0.001, ranges.reduce((sum, range) => sum + Math.max(0, range.end - range.start), 0))
+  startTaskProgress(task, totalDuration, `準備剪輯 ${ranges.length} 個片段`)
+  let completedDuration = 0
   for (let index = 0; index < ranges.length; index += 1) {
     throwIfStopRequested(task)
     if (task.progress) task.progress.label = `正在剪輯片段 ${index + 1}/${ranges.length}`
-    await clipRange(task, ranges[index], destination(task, ranges.length > 1 ? `_${String(index + 1).padStart(3, '0')}` : ''))
+    await clipRange(task, ranges[index], destination(task, ranges.length > 1 ? `_${String(index + 1).padStart(3, '0')}` : ''), completedDuration)
     throwIfStopRequested(task)
-    completeTaskStep(task, `已完成片段 ${index + 1}/${ranges.length}`)
+    completedDuration += Math.max(0, ranges[index].end - ranges[index].start)
+    if (task.progress) {
+      task.progress.completed = Math.min(task.progress.total, completedDuration)
+      task.progress.label = `已完成片段 ${index + 1}/${ranges.length}`
+    }
   }
 }
 async function runMergeTask(task: VideoTask) {
-  startTaskProgress(task, task.segments.length + 1, `準備剪輯 ${task.segments.length} 個片段`)
+  const clipsDuration = Math.max(0.001, task.segments.reduce((sum, segment) => sum + Math.max(0, segment.end - segment.start), 0))
+  const totalDuration = clipsDuration * 2
+  startTaskProgress(task, totalDuration, `準備剪輯 ${task.segments.length} 個片段`)
   const clips: string[] = []
+  let completedDuration = 0
   for (let index = 0; index < task.segments.length; index += 1) {
     throwIfStopRequested(task)
     if (task.progress) task.progress.label = `正在剪輯片段 ${index + 1}/${task.segments.length}`
     const path = destination(task, `_segment_${String(index + 1).padStart(3, '0')}`)
-    await clipRange(task, task.segments[index], path)
+    await clipRange(task, task.segments[index], path, completedDuration)
     throwIfStopRequested(task)
     clips.push(path)
-    completeTaskStep(task, `已完成片段 ${index + 1}/${task.segments.length}`)
+    completedDuration += Math.max(0, task.segments[index].end - task.segments[index].start)
+    if (task.progress) {
+      task.progress.completed = completedDuration
+      task.progress.label = `已完成片段 ${index + 1}/${task.segments.length}`
+    }
   }
   throwIfStopRequested(task)
   if (task.progress) task.progress.label = '正在合併片段'
-  await invoke('concat_videos', {
-    ffmpegPath: ffmpegPath.value || null,
-    files: clips,
-    outputPath: destination(task),
-    extraArgs: parseExtraArgs(task.extraArgs),
-    deleteInputs: !task.keepSegments,
-  })
+  await concatWithProgress(task, clips, destination(task), parseExtraArgs(task.extraArgs), !task.keepSegments, clipsDuration, clipsDuration)
   throwIfStopRequested(task)
   completeTaskStep(task, '合併完成')
 }
 async function runCombineTask(task: VideoTask) {
-  startTaskProgress(task, 1, '正在合併影片')
+  let totalDuration = 0
+  for (const source of task.combineSources) totalDuration += Math.max(0, await videoDuration(source))
+  totalDuration = Math.max(0.001, totalDuration)
+  startTaskProgress(task, totalDuration, '正在合併影片')
   const path = destination(task)
   throwIfStopRequested(task)
   if (task.combineMode === 'copy') {
-    await invoke('concat_videos', { ffmpegPath: ffmpegPath.value || null, files: task.combineSources, outputPath: path, extraArgs: [], deleteInputs: false })
+    await concatWithProgress(task, task.combineSources, path, [], false, 0, totalDuration)
   } else {
     const inputArgs = task.combineSources.flatMap((file) => ['-i', file])
     const n = task.combineSources.length
     const filterInputs = task.combineSources.map((_, index) => `[${index}:v:0][${index}:a:0]`).join('')
     const filter = `${filterInputs}concat=n=${n}:v=1:a=1[outv][outa]`
     const args = [...inputArgs, '-filter_complex', filter, '-map', '[outv]', '-map', '[outa]', '-c:v', 'libx264', '-c:a', 'aac', path, '-y']
-    await invoke('run_ffmpeg', { ffmpegPath: ffmpegPath.value || null, args })
+    await runFfmpegWithProgress(task, args, 0, totalDuration)
   }
   throwIfStopRequested(task)
   let sizeBytes = 0

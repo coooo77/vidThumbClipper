@@ -16,13 +16,11 @@ const notifyTrigger = ref<NotifyTrigger>('batch')
 const notifyOnFailure = ref(true)
 const diskSafetyEnabled = ref(false)
 const diskSafetyMinGb = ref(100)
-const thumbnailPreset = ref<ThumbnailPreset>('balanced')
+const thumbnailPreset = ref<ThumbnailPreset>('legacy')
 const thumbnailMaxHeight = ref(720)
-const thumbnailOriginalSize = ref(false)
+const thumbnailOriginalSize = ref(true)
 const thumbnailQuality = ref(5)
-const thumbnailSeekMode = ref<ThumbnailSeekMode>('precise')
-const thumbnailDecoderThreads = ref(2)
-const thumbnailConcurrency = ref<1 | 2>(1)
+const thumbnailSeekMode = ref<ThumbnailSeekMode>('fast')
 const thumbnailHardwareAcceleration = ref(false)
 
 onMounted(() => {
@@ -42,8 +40,6 @@ onMounted(() => {
   thumbnailOriginalSize.value = thumbnail.originalSize
   thumbnailQuality.value = thumbnail.quality
   thumbnailSeekMode.value = thumbnail.seekMode
-  thumbnailDecoderThreads.value = thumbnail.decoderThreads
-  thumbnailConcurrency.value = thumbnail.concurrency
   thumbnailHardwareAcceleration.value = thumbnail.hardwareAcceleration
 })
 
@@ -66,8 +62,6 @@ function saveSettings() {
     originalSize: thumbnailOriginalSize.value,
     quality: thumbnailQuality.value,
     seekMode: thumbnailSeekMode.value,
-    decoderThreads: thumbnailDecoderThreads.value,
-    concurrency: thumbnailConcurrency.value,
     hardwareAcceleration: thumbnailHardwareAcceleration.value,
   })
   showStatus('設定已儲存。')
@@ -78,8 +72,6 @@ function applyThumbnailPreset() {
   thumbnailOriginalSize.value = settings.originalSize
   thumbnailQuality.value = settings.quality
   thumbnailSeekMode.value = settings.seekMode
-  thumbnailDecoderThreads.value = settings.decoderThreads
-  thumbnailConcurrency.value = settings.concurrency
   thumbnailHardwareAcceleration.value = settings.hardwareAcceleration
   saveSettings()
 }
@@ -157,36 +149,26 @@ async function clearThumbnailCache() {
 
     <section class="card settings-card">
       <h2 class="card-title">縮圖擷取預設</h2>
-      <p class="description">首頁每次開啟時會套用這組預設。預設最大高度為 720p；來源影片較小時會保留原始尺寸，不會放大。</p>
+      <p class="description">「高速相容」會使用目前已確認速度正常的舊版截圖路徑。縮放或精確定位會增加處理時間。</p>
       <div class="input-group">
-        <label>品質方案</label>
+        <label>方案</label>
         <select v-model="thumbnailPreset" @change="applyThumbnailPreset">
-          <option value="fast">快速（360p、最多同時 2 張）</option>
-          <option value="balanced">平衡（720p、低負載）</option>
-          <option value="high">高品質（1080p、精確定位）</option>
+          <option value="legacy">高速相容（原始尺寸、快速定位）</option>
+          <option value="compact">節省空間（480p）</option>
+          <option value="quality">高品質（720p、精確定位）</option>
         </select>
       </div>
       <div class="thumbnail-default-grid">
-        <div class="input-group thumbnail-size-setting">
-          <label>最大高度（px）</label>
-          <div class="thumbnail-size-control">
-            <input v-model.number="thumbnailMaxHeight" :disabled="thumbnailOriginalSize" type="number" min="144" max="2160" step="40" @change="saveSettings" />
-            <button
-              type="button"
-              class="original-size-button"
-              :class="{ active: thumbnailOriginalSize }"
-              :aria-pressed="thumbnailOriginalSize"
-              @click="thumbnailOriginalSize = !thumbnailOriginalSize; saveSettings()"
-            >{{ thumbnailOriginalSize ? '✓ 原始尺寸' : '使用原始尺寸' }}</button>
-          </div>
-          <p class="field-hint">設定的是高度上限；影片本身較小時不會放大。</p>
-        </div>
+        <div class="input-group"><label>最大高度（px）</label><input v-model.number="thumbnailMaxHeight" :disabled="thumbnailOriginalSize" type="number" min="144" max="2160" step="40" @change="saveSettings" /></div>
         <div class="input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" type="number" min="2" max="12" @change="saveSettings" /></div>
-        <div class="input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" @change="saveSettings"><option value="fast">快速</option><option value="precise">精確</option></select></div>
-        <div class="input-group"><label>解碼執行緒（0＝自動，1–4＝限制）</label><input v-model.number="thumbnailDecoderThreads" type="number" min="0" max="4" @change="saveSettings" /></div>
-        <div class="input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency" @change="saveSettings"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
+        <div class="input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" @change="saveSettings"><option value="fast">快速</option><option value="precise">精確（較慢）</option></select></div>
+        <div class="input-group thumbnail-size-setting">
+          <label>圖片尺寸</label>
+          <button type="button" class="original-size-button" :class="{ active: thumbnailOriginalSize }" @click="thumbnailOriginalSize = !thumbnailOriginalSize; saveSettings()">{{ thumbnailOriginalSize ? '✓ 使用原始尺寸' : `限制為 ${thumbnailMaxHeight}p（不放大）` }}</button>
+        </div>
       </div>
-      <label class="checkbox-row-label"><input v-model="thumbnailHardwareAcceleration" type="checkbox" @change="saveSettings" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>
+      <label class="checkbox-row-label"><input v-model="thumbnailHardwareAcceleration" type="checkbox" @change="saveSettings" /> 實驗性硬體解碼（失敗時自動改用軟體解碼）</label>
+      <p class="field-hint">為避免搶用 CPU 與硬碟，縮圖固定逐張擷取，FFmpeg 執行緒維持自動管理。</p>
     </section>
 
     <section class="card settings-card">

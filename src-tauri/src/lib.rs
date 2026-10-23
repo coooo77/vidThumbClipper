@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,13 +90,26 @@ fn run_controlled(
     mut child: std::process::Child,
     deadline: std::time::Instant,
     cancelled: &AtomicBool,
+    progress: Option<Arc<dyn Fn(f64) + Send + Sync>>,
 ) -> Result<std::process::Output, String> {
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
     let stdout_handle = std::thread::spawn(move || {
         let mut buffer = Vec::new();
-        if let Some(pipe) = stdout_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut buffer);
+        if let Some(pipe) = stdout_pipe.take() {
+            let mut reader = BufReader::new(pipe);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                buffer.extend_from_slice(line.as_bytes());
+                if let Some(callback) = progress.as_ref() {
+                    if let Some(raw) = line.trim().strip_prefix("out_time_us=") {
+                        if let Ok(microseconds) = raw.parse::<f64>() {
+                            callback(microseconds / 1_000_000.0);
+                        }
+                    }
+                }
+                line.clear();
+            }
         }
         buffer
     });
@@ -190,6 +203,7 @@ fn run_tracked_process(
     mut child: std::process::Child,
     timeout: std::time::Duration,
     running: &RunningProcessState,
+    progress: Option<Arc<dyn Fn(f64) + Send + Sync>>,
 ) -> Result<std::process::Output, String> {
     let pid = child.id();
     let cancel_token = Arc::new(AtomicBool::new(false));
@@ -220,7 +234,12 @@ fn run_tracked_process(
         });
     }
 
-    let result = run_controlled(child, std::time::Instant::now() + timeout, &cancel_token);
+    let result = run_controlled(
+        child,
+        std::time::Instant::now() + timeout,
+        &cancel_token,
+        progress,
+    );
     finish_tracked_process(running, pid, &cancel_token, result)
 }
 
@@ -421,16 +440,11 @@ fn get_available_space(path: String) -> Result<u64, String> {
     available_space_for_path(trimmed)
 }
 
-fn append_decoder_thread_limit(args: &mut Vec<String>, decoder_threads: u8) {
-    if decoder_threads > 0 {
-        args.extend(["-threads".to_string(), decoder_threads.to_string()]);
-    }
-}
-
 #[tauri::command]
 async fn run_ffmpeg(
     ffmpeg_path: Option<String>,
     args: Vec<String>,
+    on_progress: tauri::ipc::Channel<f64>,
     running: tauri::State<'_, RunningProcessState>,
 ) -> Result<String, String> {
     let running = running.inner().clone();
@@ -439,12 +453,21 @@ async fn run_ffmpeg(
             .filter(|path| !path.trim().is_empty())
             .unwrap_or_else(|| "ffmpeg".into());
         let child = spawn_hidden(&executable)
+            .args(["-progress", "pipe:1", "-nostats"])
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| format!("Unable to run ffmpeg: {error}"))?;
-        let output = run_tracked_process(child, std::time::Duration::from_secs(3600), &running)?;
+        let progress_callback: Arc<dyn Fn(f64) + Send + Sync> = Arc::new(move |seconds| {
+            let _ = on_progress.send(seconds);
+        });
+        let output = run_tracked_process(
+            child,
+            std::time::Duration::from_secs(3600),
+            &running,
+            Some(progress_callback),
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         if output.status.success() {
@@ -505,7 +528,6 @@ async fn capture_single_thumbnail(
     original_size: bool,
     quality: u8,
     seek_mode: String,
-    decoder_threads: u8,
     hardware_acceleration: bool,
 ) -> Result<String, String> {
     let cancelled = runs
@@ -514,15 +536,14 @@ async fn capture_single_thumbnail(
         .get(&request_id)
         .cloned()
         .ok_or("Unknown thumbnail request")?;
-    // A complete precise-seek fallback may need longer on multi-hour transport streams. Each
-    // individual attempt is still bounded so one bad timestamp cannot hang the queue forever.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let timeout_seconds = if seek_mode == "precise" { 90 } else { 30 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
     tauri::async_runtime::spawn_blocking(move || {
         let check = || {
             if cancelled.load(Ordering::SeqCst) {
                 Err("Thumbnail cancelled".to_string())
             } else if std::time::Instant::now() >= deadline {
-                Err("Thumbnail timed out after 90 seconds".to_string())
+                Err(format!("Thumbnail timed out after {timeout_seconds} seconds"))
             } else {
                 Ok(())
             }
@@ -544,60 +565,36 @@ async fn capture_single_thumbnail(
         let mut debug = Vec::new();
         let max_height = max_height.clamp(144, 2160);
         let quality = quality.clamp(2, 12).to_string();
-        let decoder_threads = decoder_threads.clamp(0, 4);
-        // Limit by height (the conventional meaning of 720p) and never enlarge a smaller source.
-        // FFmpeg's expression comma must be escaped so it is not parsed as another filter.
-        let scale_filter = format!("scale=-2:min({max_height}\\,ih)");
-        let target_seconds = time
-            .parse::<f64>()
-            .map_err(|error| format!("Invalid thumbnail timestamp '{time}': {error}"))?;
-        let build_args = |mode: &str, output_path: &str| {
+        let build_args = |precise: bool, output_path: &str, hardware: bool| {
             let mut args = vec!["-y".to_string()];
-            if hardware_acceleration {
+            if hardware {
                 args.extend(["-hwaccel".to_string(), "auto".to_string()]);
             }
-            if mode == "fast" {
+            if !precise {
                 args.extend(["-ss".to_string(), time.clone()]);
-            } else if mode == "hybrid" {
-                args.extend([
-                    "-ss".to_string(),
-                    (target_seconds - 30.0).max(0.0).to_string(),
-                ]);
             }
-            // Zero means FFmpeg decides the decoder thread count. This matches the original fast
-            // capture path and avoids throttling long H.264 transport streams to one or two cores.
-            append_decoder_thread_limit(&mut args, decoder_threads);
             args.extend(["-i".to_string(), video_path.clone()]);
-            if mode == "full" {
+            if precise {
                 args.extend(["-ss".to_string(), time.clone()]);
-            } else if mode == "hybrid" {
-                args.extend([
-                    "-ss".to_string(),
-                    target_seconds.min(30.0).to_string(),
-                ]);
             }
             args.extend(["-vframes".to_string(), "1".to_string()]);
             if !original_size {
-                args.extend(["-vf".to_string(), scale_filter.clone()]);
+                // Limit by height and never enlarge a smaller source.
+                args.extend([
+                    "-vf".to_string(),
+                    format!("scale=-2:min({max_height}\\,ih)"),
+                ]);
             }
             args.extend([
-                "-q:v".to_string(),
-                quality.clone(),
-                "-pix_fmt".to_string(),
-                "yuvj420p".to_string(),
-                "-strict".to_string(),
-                "unofficial".to_string(),
+                "-q:v".to_string(), quality.clone(),
+                "-pix_fmt".to_string(), "yuvj420p".to_string(),
+                "-strict".to_string(), "unofficial".to_string(),
                 output_path.to_string(),
             ]);
             args
         };
-
-        // The selected seek mode is attempted first. Fast mode falls back to precise mode when it
-        // cannot produce a usable file. Both attempts drain output continuously and have a hard
-        // timeout, so a bad timestamp cannot leave the frontend stuck forever.
         let prefer_precise = seek_mode == "precise";
-        let primary_mode = if prefer_precise { "hybrid" } else { "fast" };
-        let fast_args = build_args(primary_mode, &fast_path_string);
+        let fast_args = build_args(prefer_precise, &fast_path_string, hardware_acceleration);
         let fast_started = std::time::Instant::now();
         let fast_output = spawn_hidden(&executable)
             .args(&fast_args)
@@ -608,8 +605,9 @@ async fn capture_single_thumbnail(
             .and_then(|child| {
                 run_controlled(
                     child,
-                    deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(45)),
+                    deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(if prefer_precise { 60 } else { 20 })),
                     &cancelled,
+                    None,
                 )
             });
         let fast_ok = matches!(&fast_output, Ok(output) if output.status.success())
@@ -633,9 +631,7 @@ async fn capture_single_thumbnail(
             }
             let precise_path = cache_dir.join(format!("thumbnail_{index}_{timestamp}_precise.jpg"));
             let precise_path_string = precise_path.to_string_lossy().to_string();
-            let fallback_mode = if prefer_precise { "full" } else { "hybrid" };
-            let precise_args = build_args(fallback_mode, &precise_path_string);
-            // Both attempts share the same 90-second deadline; fallback gets only what remains.
+            let precise_args = build_args(true, &precise_path_string, hardware_acceleration);
             let precise_started = std::time::Instant::now();
             let precise_output = spawn_hidden(&executable)
                 .args(&precise_args)
@@ -643,11 +639,11 @@ async fn capture_single_thumbnail(
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|error| format!("Unable to run ffmpeg: {error}"))
-                .and_then(|child| run_controlled(child, deadline, &cancelled));
+                .and_then(|child| run_controlled(child, deadline, &cancelled, None));
             let precise_ok = matches!(&precise_output, Ok(output) if output.status.success())
                 && captured_ok(&precise_path);
             debug.push(thumbnail_attempt_debug(
-                if prefer_precise { "full-precise-fallback" } else { "hybrid-precise-fallback" },
+                "precise",
                 precise_started.elapsed(),
                 &precise_output,
                 &precise_path,
@@ -656,7 +652,7 @@ async fn capture_single_thumbnail(
             if !precise_ok {
                 let _ = std::fs::remove_file(&precise_path);
                 return Err(format!(
-                    "Thumbnail capture at {time} failed ({primary_mode} + {fallback_mode} seek).\n{}",
+                    "Thumbnail capture at {time} failed (fast + precise seek).\n{}",
                     debug.join("\n"),
                 ));
             }
@@ -727,6 +723,7 @@ async fn concat_videos(
     output_path: String,
     extra_args: Vec<String>,
     delete_inputs: bool,
+    on_progress: tauri::ipc::Channel<f64>,
     running: tauri::State<'_, RunningProcessState>,
 ) -> Result<(), String> {
     let running = running.inner().clone();
@@ -766,13 +763,22 @@ async fn concat_videos(
         args.push(output_path);
         args.push("-y".into());
         let child = spawn_hidden(&executable)
+            .args(["-progress", "pipe:1", "-nostats"])
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| format!("Unable to run ffmpeg: {error}"));
+        let progress_callback: Arc<dyn Fn(f64) + Send + Sync> = Arc::new(move |seconds| {
+            let _ = on_progress.send(seconds);
+        });
         let output = child.and_then(|child| {
-            run_tracked_process(child, std::time::Duration::from_secs(3600), &running)
+            run_tracked_process(
+                child,
+                std::time::Duration::from_secs(3600),
+                &running,
+                Some(progress_callback),
+            )
         });
         let _ = std::fs::remove_file(list_path);
         let output = output?;
@@ -849,20 +855,6 @@ mod tests {
     }
 
     #[test]
-    fn automatic_decoder_threads_leave_ffmpeg_unrestricted() {
-        let mut args = Vec::new();
-        append_decoder_thread_limit(&mut args, 0);
-        assert!(args.is_empty());
-    }
-
-    #[test]
-    fn explicit_decoder_thread_limit_is_preserved() {
-        let mut args = Vec::new();
-        append_decoder_thread_limit(&mut args, 2);
-        assert_eq!(args, ["-threads", "2"]);
-    }
-
-    #[test]
     #[ignore = "subprocess fixture only"]
     fn process_fixture() {
         if std::env::var("THUMBNAIL_TEST_MODE").unwrap() == "output" {
@@ -888,7 +880,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(150));
             signal.store(true, Ordering::SeqCst);
         });
-        let error = run_controlled(child, started + Duration::from_secs(8), &cancel).unwrap_err();
+        let error =
+            run_controlled(child, started + Duration::from_secs(8), &cancel, None).unwrap_err();
         setter.join().unwrap();
         assert!(error.contains("Process cancelled"), "{error}");
         assert!(error.contains("stop result: Ok"), "{error}");
@@ -912,7 +905,7 @@ mod tests {
                 .is_some());
         });
 
-        let error = run_tracked_process(fixture("sleep"), Duration::from_secs(8), &running)
+        let error = run_tracked_process(fixture("sleep"), Duration::from_secs(8), &running, None)
             .expect_err("the tracked cancellation must be returned as an error");
         setter.join().unwrap();
 
@@ -951,7 +944,7 @@ mod tests {
         assert!(task_batch_cancelled(&running).unwrap());
 
         let started = Instant::now();
-        let error = run_tracked_process(fixture("sleep"), Duration::from_secs(8), &running)
+        let error = run_tracked_process(fixture("sleep"), Duration::from_secs(8), &running, None)
             .expect_err("the latched batch cancellation must reject the next child");
 
         assert_eq!(error, "Process cancelled");
@@ -996,10 +989,11 @@ mod tests {
             fixture("sleep"),
             started + Duration::from_millis(300),
             &cancel,
+            None,
         )
         .unwrap_err();
         assert!(fast.contains("timed out"), "{fast}");
-        let precise = run_controlled(fixture("sleep"), deadline, &cancel).unwrap_err();
+        let precise = run_controlled(fixture("sleep"), deadline, &cancel, None).unwrap_err();
         assert!(precise.contains("timed out"), "{precise}");
         assert!(precise.contains("stop result: Ok"), "{precise}");
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -1011,6 +1005,7 @@ mod tests {
             fixture("output"),
             Instant::now() + Duration::from_secs(5),
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         assert!(output.status.success());

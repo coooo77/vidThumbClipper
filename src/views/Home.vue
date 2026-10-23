@@ -21,7 +21,9 @@ import { clearWorkspaceDraft, loadWorkspaceDraft, saveWorkspaceDraft } from '../
 import { directoryOf as dirName, formatTimecode as formatSeconds } from '../videoUtils'
 import {
   getThumbnailSettings,
+  isLegacyFastSettings,
   normaliseThumbnailSettings,
+  saveThumbnailSettings,
   settingsForPreset,
   type ThumbnailPreset,
   type ThumbnailSeekMode,
@@ -68,16 +70,15 @@ const filmstripVisible = ref(true)
 const logs = ref<string[]>([])
 const progressText = ref('')
 const progressPercent = ref(0)
-const thumbnailPreset = ref<ThumbnailPreset>('balanced')
+const thumbnailPreset = ref<ThumbnailPreset>('legacy')
 const thumbnailMaxHeight = ref(720)
-const thumbnailOriginalSize = ref(false)
+const thumbnailOriginalSize = ref(true)
 const thumbnailQuality = ref(5)
-const thumbnailSeekMode = ref<ThumbnailSeekMode>('precise')
-const thumbnailDecoderThreads = ref(2)
-const thumbnailConcurrency = ref<1 | 2>(1)
+const thumbnailSeekMode = ref<ThumbnailSeekMode>('fast')
 const thumbnailHardwareAcceleration = ref(false)
 const showAdvancedCaptureSettings = ref(false)
 const thumbnailSettingsLocked = computed(() => isProcessing.value || isEndpointProcessing.value || isExpanding.value)
+const legacyFastCaptureActive = computed(() => isLegacyFastSettings(currentThumbnailSettings()))
 const workspaceRecovered = ref(false)
 let workspaceReady = false
 let workspaceSaveTimer: ReturnType<typeof setTimeout> | null = null
@@ -340,20 +341,7 @@ function loadPaths() {
   thumbnailOriginalSize.value = thumbnail.originalSize
   thumbnailQuality.value = thumbnail.quality
   thumbnailSeekMode.value = thumbnail.seekMode
-  thumbnailDecoderThreads.value = thumbnail.decoderThreads
-  thumbnailConcurrency.value = thumbnail.concurrency
   thumbnailHardwareAcceleration.value = thumbnail.hardwareAcceleration
-}
-
-function applyThumbnailPreset() {
-  const settings = settingsForPreset(thumbnailPreset.value)
-  thumbnailMaxHeight.value = settings.maxHeight
-  thumbnailOriginalSize.value = settings.originalSize
-  thumbnailQuality.value = settings.quality
-  thumbnailSeekMode.value = settings.seekMode
-  thumbnailDecoderThreads.value = settings.decoderThreads
-  thumbnailConcurrency.value = settings.concurrency
-  thumbnailHardwareAcceleration.value = settings.hardwareAcceleration
 }
 
 function currentThumbnailSettings(): ThumbnailSettings {
@@ -363,10 +351,23 @@ function currentThumbnailSettings(): ThumbnailSettings {
     originalSize: thumbnailOriginalSize.value,
     quality: thumbnailQuality.value,
     seekMode: thumbnailSeekMode.value,
-    decoderThreads: thumbnailDecoderThreads.value,
-    concurrency: thumbnailConcurrency.value,
     hardwareAcceleration: thumbnailHardwareAcceleration.value,
   })
+}
+
+function persistThumbnailSettings() {
+  const settings = currentThumbnailSettings()
+  saveThumbnailSettings(settings)
+}
+
+function applyThumbnailPreset() {
+  const settings = settingsForPreset(thumbnailPreset.value)
+  thumbnailMaxHeight.value = settings.maxHeight
+  thumbnailOriginalSize.value = settings.originalSize
+  thumbnailQuality.value = settings.quality
+  thumbnailSeekMode.value = settings.seekMode
+  thumbnailHardwareAcceleration.value = settings.hardwareAcceleration
+  persistThumbnailSettings()
 }
 
 function restoreSavedWorkspace() {
@@ -954,7 +955,6 @@ async function captureThumbnail(args: Record<string, unknown>, shouldStop?: () =
       originalSize: settings.originalSize,
       quality: settings.quality,
       seekMode: settings.seekMode,
-      decoderThreads: settings.decoderThreads,
       hardwareAcceleration: settings.hardwareAcceleration,
     }
     try {
@@ -980,43 +980,32 @@ function stopActiveThumbnail() {
 async function captureAtTimes(times: number[], offset: number, shouldStop?: () => boolean, onCaptured?: (item: ThumbnailItem, index: number) => void) {
   const result: ThumbnailItem[] = []
   const settings = currentThumbnailSettings()
-  let nextIndex = 0
-  let completed = 0
-  let firstError: unknown = null
-  const worker = async () => {
-    while (!firstError) {
-      if (shouldStop?.()) return
-      const index = nextIndex
-      nextIndex += 1
-      if (index >= times.length) return
-      progressText.value = `正在擷取 ${completed + 1}/${times.length} 張（${progressPercent.value}%）`
-      try {
-        const base64 = await captureThumbnail({
-          ffmpegPath: ffmpegPath.value || null,
-          videoPath: videoPath.value,
-          time: times[index].toFixed(3),
-          index: offset + index,
-        }, shouldStop, settings)
-        const item = { time: times[index], timeStr: formatSeconds(times[index]), base64: `data:image/jpeg;base64,${base64}` }
-        result.push(item)
-        onCaptured?.(item, index)
-        completed += 1
-        progressPercent.value = Math.round((completed / times.length) * 100)
-        progressText.value = `已完成擷取 ${completed}/${times.length} 張（${progressPercent.value}%）`
-      } catch (error) {
-        if (shouldStop?.()) {
-          if (String(error).includes('cleanup') || String(error).includes('stop result: Err')) addLog(`取消後程序清理異常：${String(error)}`)
-          return
-        }
-        if (!firstError) firstError = error
-        stopActiveThumbnail()
+  for (let index = 0; index < times.length; index += 1) {
+    if (shouldStop?.()) break
+    progressPercent.value = Math.round((index / times.length) * 100)
+    progressText.value = `正在擷取 ${index + 1}/${times.length} 張（${progressPercent.value}%）`
+    let base64: string
+    try {
+      base64 = await captureThumbnail({
+        ffmpegPath: ffmpegPath.value || null,
+        videoPath: videoPath.value,
+        time: times[index].toFixed(3),
+        index: offset + index,
+      }, shouldStop, settings)
+    } catch (error) {
+      if (shouldStop?.()) {
+        if (String(error).includes('cleanup') || String(error).includes('stop result: Err')) addLog(`取消後程序清理異常：${String(error)}`)
+        break
       }
+      throw error
     }
+    const item = { time: times[index], timeStr: formatSeconds(times[index]), base64: `data:image/jpeg;base64,${base64}` }
+    result.push(item)
+    onCaptured?.(item, index)
+    progressPercent.value = Math.round(((index + 1) / times.length) * 100)
+    progressText.value = `已完成擷取 ${index + 1}/${times.length} 張（${progressPercent.value}%）`
   }
-  const workerCount = Math.min(settings.concurrency, Math.max(1, times.length))
-  await Promise.all(Array.from({ length: workerCount }, worker))
-  if (firstError) throw firstError
-  return result.sort((a, b) => a.time - b.time)
+  return result
 }
 
 async function generateGridThumbnails() {
@@ -1088,7 +1077,6 @@ function cancelInitialThumbnailCapture() {
 async function captureEndpointThumbnails(duration: number) {
   if (!showStartEndpoint.value && !showEndEndpoint.value) return
   isEndpointProcessing.value = true
-  const settings = currentThumbnailSettings()
   addLog('開始背景擷取起點與終點縮圖；這不會阻塞擴充佇列。')
   try {
     const endpointResults = await Promise.allSettled([
@@ -1098,7 +1086,7 @@ async function captureEndpointThumbnails(duration: number) {
             videoPath: videoPath.value,
             time: '0.000',
             index: -1,
-          }, undefined, settings)
+          })
         : Promise.resolve(null),
       showEndEndpoint.value
         ? captureThumbnail({
@@ -1108,7 +1096,7 @@ async function captureEndpointThumbnails(duration: number) {
             // report a final timestamp for which input-side seek produces an empty image.
             time: Math.max(0, duration - 2).toFixed(3),
             index: -2,
-          }, undefined, settings)
+          })
         : Promise.resolve(null),
     ])
     const [startResult, endResult] = endpointResults
@@ -1700,40 +1688,45 @@ function createCombineTask() {
 
         <div v-if="loadSubPanel !== 'source'" class="load-panel-capture-area">
           <div v-if="loadSubPanel === 'init'" class="subsection capture-section">
-          <div class="input-group capture-quality-field">
-            <label>縮圖品質</label>
-            <select v-model="thumbnailPreset" :disabled="thumbnailSettingsLocked" @change="applyThumbnailPreset">
-              <option value="fast">快速</option>
-              <option value="balanced">平衡</option>
-              <option value="high">高品質</option>
-            </select>
-          </div>
-          <button type="button" class="advanced-capture-toggle" @click="showAdvancedCaptureSettings = !showAdvancedCaptureSettings">
-            {{ showAdvancedCaptureSettings ? '收合進階截圖設定 ▴' : '進階截圖設定 ▾' }}
-          </button>
-          <div v-if="showAdvancedCaptureSettings" class="advanced-capture-settings">
-            <p v-if="thumbnailSettingsLocked" class="capture-settings-lock-note">正在擷取，本批已鎖定開始時的設定；調整功能會在完成後恢復。</p>
-            <div class="advanced-settings-grid">
-              <div class="input-group advanced-size-field">
-                <label>最大高度（px）</label>
-                <div class="capture-size-control">
-                  <input v-model.number="thumbnailMaxHeight" :disabled="thumbnailSettingsLocked || thumbnailOriginalSize" type="number" min="144" max="2160" step="40" />
-                  <button
-                    type="button"
-                    class="original-size-button"
-                    :class="{ active: thumbnailOriginalSize }"
-                    :disabled="thumbnailSettingsLocked"
-                    :aria-pressed="thumbnailOriginalSize"
-                    @click="thumbnailOriginalSize = !thumbnailOriginalSize"
-                  >{{ thumbnailOriginalSize ? '✓ 原始尺寸' : '使用原始尺寸' }}</button>
-                </div>
-                <p class="capture-setting-hint">預設 720p；來源影片較小時不會放大。</p>
+          <div class="capture-settings-box">
+            <div class="capture-settings-header">
+              <div>
+                <strong>縮圖擷取設定</strong>
+                <span :class="['capture-speed-badge', { fast: legacyFastCaptureActive }]">{{ legacyFastCaptureActive ? '舊版高速路徑' : '自訂處理' }}</span>
               </div>
-              <div class="input-group"><label>JPEG 品質（2 最佳、12 最快）</label><input v-model.number="thumbnailQuality" :disabled="thumbnailSettingsLocked" type="number" min="2" max="12" /></div>
-              <div class="input-group"><label>定位模式</label><select v-model="thumbnailSeekMode" :disabled="thumbnailSettingsLocked"><option value="precise">精確（預設）</option><option value="fast">快速</option></select></div>
-              <div class="input-group"><label>同時擷取</label><select v-model.number="thumbnailConcurrency" :disabled="thumbnailSettingsLocked"><option :value="1">1 張（低負載）</option><option :value="2">2 張（較快）</option></select></div>
-              <div class="input-group"><label>解碼執行緒（0＝自動，1–4＝限制）</label><input v-model.number="thumbnailDecoderThreads" :disabled="thumbnailSettingsLocked" type="number" min="0" max="4" /></div>
-              <label class="checkbox-row advanced-setting-checkbox"><input v-model="thumbnailHardwareAcceleration" :disabled="thumbnailSettingsLocked" type="checkbox" /> 實驗性硬體解碼（失敗時自動退回軟體解碼）</label>
+              <button type="button" class="btn-clear" @click="showAdvancedCaptureSettings = !showAdvancedCaptureSettings">
+                {{ showAdvancedCaptureSettings ? '收合' : '進階設定' }}
+              </button>
+            </div>
+            <div v-if="showAdvancedCaptureSettings" class="capture-settings-grid">
+              <div class="input-group capture-setting-wide">
+                <label>方案</label>
+                <select v-model="thumbnailPreset" :disabled="thumbnailSettingsLocked" @change="applyThumbnailPreset">
+                  <option value="legacy">高速相容（原始尺寸、快速定位）</option>
+                  <option value="compact">節省空間（480p）</option>
+                  <option value="quality">高品質（720p、精確定位）</option>
+                </select>
+              </div>
+              <div class="input-group">
+                <label>最大高度（px）</label>
+                <input v-model.number="thumbnailMaxHeight" :disabled="thumbnailSettingsLocked || thumbnailOriginalSize" type="number" min="144" max="2160" step="40" @change="persistThumbnailSettings" />
+              </div>
+              <div class="input-group">
+                <label>JPEG 品質（2 最佳、12 最快）</label>
+                <input v-model.number="thumbnailQuality" :disabled="thumbnailSettingsLocked" type="number" min="2" max="12" @change="persistThumbnailSettings" />
+              </div>
+              <div class="input-group">
+                <label>定位模式</label>
+                <select v-model="thumbnailSeekMode" :disabled="thumbnailSettingsLocked" @change="persistThumbnailSettings"><option value="fast">快速</option><option value="precise">精確（較慢）</option></select>
+              </div>
+              <div class="input-group capture-setting-toggle">
+                <label>圖片尺寸</label>
+                <button type="button" class="original-size-button" :class="{ active: thumbnailOriginalSize }" :disabled="thumbnailSettingsLocked" @click="thumbnailOriginalSize = !thumbnailOriginalSize; persistThumbnailSettings()">
+                  {{ thumbnailOriginalSize ? '✓ 使用原始尺寸' : `限制為 ${thumbnailMaxHeight}p` }}
+                </button>
+              </div>
+              <label class="checkbox-row capture-setting-wide"><input v-model="thumbnailHardwareAcceleration" :disabled="thumbnailSettingsLocked" type="checkbox" @change="persistThumbnailSettings" /> 實驗性硬體解碼（失敗時自動改用軟體解碼）</label>
+              <p class="capture-setting-note capture-setting-wide">縮放、精確定位或硬體解碼會離開舊版高速路徑；擷取固定依序進行，不會同時搶用磁碟。</p>
             </div>
           </div>
           <div class="mode-row">
@@ -2766,90 +2759,6 @@ select:focus {
   color: var(--text-muted);
   border: 1px dashed var(--border-color);
 }
-.capture-quality-field select,
-.advanced-capture-settings select {
-  width: 100%;
-  padding: 0.65rem 0.7rem;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.6);
-  color: var(--text-color);
-}
-.advanced-capture-toggle {
-  width: 100%;
-  margin: -0.45rem 0 0.85rem;
-  border: 0;
-  background: none;
-  color: #a5b4fc;
-  text-align: left;
-  cursor: pointer;
-}
-.advanced-capture-settings {
-  margin-bottom: 1rem;
-  padding: 0.85rem;
-  border: 1px solid rgba(99, 102, 241, 0.2);
-  border-radius: 9px;
-  background: rgba(99, 102, 241, 0.06);
-}
-.advanced-settings-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.85rem 0.9rem;
-  align-items: start;
-}
-.advanced-settings-grid .input-group {
-  min-width: 0;
-  margin: 0;
-}
-.advanced-settings-grid .input-group > label {
-  display: block;
-  min-height: 2.1em;
-}
-.advanced-size-field,
-.advanced-setting-checkbox {
-  grid-column: 1 / -1;
-}
-.capture-size-control {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 0.45rem;
-}
-.original-size-button {
-  min-width: 7.4rem;
-  padding: 0.55rem 0.7rem;
-  border: 1px solid rgba(129, 140, 248, 0.35);
-  border-radius: 8px;
-  background: rgba(30, 41, 59, 0.8);
-  color: #c7d2fe;
-  font: inherit;
-  font-size: 0.78rem;
-  cursor: pointer;
-}
-.original-size-button.active {
-  border-color: rgba(129, 140, 248, 0.75);
-  background: rgba(79, 70, 229, 0.32);
-  color: #eef2ff;
-}
-.original-size-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-.capture-setting-hint {
-  margin: 0.35rem 0 0;
-  color: var(--text-muted);
-  font-size: 0.72rem;
-  line-height: 1.35;
-}
-.advanced-setting-checkbox {
-  min-height: 43px;
-  margin-top: 0;
-}
-.capture-settings-lock-note {
-  margin-bottom: 0.8rem;
-  color: #fbbf24;
-  font-size: 0.78rem;
-  line-height: 1.45;
-}
 .workspace-recovery {
   display: flex;
   align-items: center;
@@ -3202,6 +3111,85 @@ select:focus {
   font-weight: 700;
   letter-spacing: 0.02em;
   z-index: 1;
+}
+.capture-settings-box {
+  margin-bottom: 1rem;
+  padding: 0.8rem;
+  border: 1px solid var(--border-color);
+  border-radius: 9px;
+  background: rgba(15, 23, 42, 0.35);
+}
+.capture-settings-header,
+.capture-settings-header > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+.capture-speed-badge {
+  padding: 0.18rem 0.45rem;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  font-size: 0.7rem;
+}
+.capture-speed-badge.fast {
+  background: rgba(16, 185, 129, 0.15);
+  color: #6ee7b7;
+}
+.capture-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.85rem 0.75rem;
+  margin-top: 0.9rem;
+  align-items: end;
+}
+.capture-setting-wide { grid-column: 1 / -1; }
+.capture-settings-grid .input-group {
+  min-width: 0;
+  margin: 0;
+}
+.capture-settings-grid .input-group > label {
+  display: flex;
+  align-items: flex-end;
+  min-height: 2.45rem;
+  margin-bottom: 0.45rem;
+  line-height: 1.35;
+}
+.capture-settings-grid input,
+.capture-settings-grid select {
+  box-sizing: border-box;
+  height: 44px;
+  width: 100%;
+  padding: 0.65rem 0.7rem;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.6);
+  color: var(--text-color);
+}
+.capture-setting-toggle .original-size-button { width: 100%; height: 44px; }
+.original-size-button {
+  padding: 0.6rem 0.7rem;
+  border: 1px solid rgba(129, 140, 248, 0.35);
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.8);
+  color: #c7d2fe;
+  cursor: pointer;
+}
+.original-size-button.active {
+  border-color: rgba(129, 140, 248, 0.75);
+  background: rgba(79, 70, 229, 0.32);
+}
+.capture-setting-note {
+  margin: -0.35rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+@media (max-width: 420px) {
+  .capture-settings-grid { grid-template-columns: 1fr; }
+  .capture-setting-wide { grid-column: 1; }
+  .capture-settings-grid .input-group > label { min-height: 0; }
 }
 @media (min-width: 901px) {
   .main-layout {

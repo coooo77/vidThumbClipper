@@ -271,6 +271,7 @@ const gridRowPitch = computed(() => {
 const gridTotalRows = computed(() => Math.ceil(gridSequence.value.length / gridColumnCount.value))
 const gridFirstRow = computed(() => Math.max(0, Math.floor(gridScrollTop.value / gridRowPitch.value) - 3))
 const gridLastRow = computed(() => Math.min(gridTotalRows.value, Math.ceil((gridScrollTop.value + gridHeight.value) / gridRowPitch.value) + 3))
+const showGridBackToTop = computed(() => gridScrollTop.value > Math.max(240, gridHeight.value * 0.75))
 const visibleGridItems = computed(() => gridSequence.value.slice(gridFirstRow.value * gridColumnCount.value, gridLastRow.value * gridColumnCount.value)
   .map((item, offset) => ({ ...item, index: gridFirstRow.value * gridColumnCount.value + offset })))
 const gridCanvasHeight = computed(() => gridTotalRows.value * gridRowPitch.value)
@@ -284,6 +285,10 @@ function measureGrid() {
 }
 function onGridScroll() {
   if (gridRef.value) gridScrollTop.value = gridRef.value.scrollTop
+}
+
+function scrollGridToTop() {
+  gridRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
 }
 watch(gridRef, (element) => {
   gridResizeObserver?.disconnect()
@@ -2145,27 +2150,30 @@ function createCombineTask() {
             <button class="btn btn-primary compact" :disabled="isProcessing" @click="reloadRecoveredWorkspaceThumbnails">重新載入縮圖</button>
           </div>
         </div>
-        <div v-if="hasPreviewContent" ref="gridRef" class="grid-container" @scroll.passive="onGridScroll">
-          <div class="grid-virtual-canvas" :style="{ height: `${gridCanvasHeight}px` }">
-            <div class="grid-visible-rows" :style="{ top: `${gridFirstRow * gridRowPitch}px`, gridTemplateColumns: `repeat(${gridColumnCount}, minmax(0, 1fr))`, gridAutoRows: `${gridRowPitch - 3}px` }">
-              <div
-                v-for="item in visibleGridItems"
-                :key="`${item.time}-${item.index}`"
-                class="grid-item-img"
-                :class="{
-                  endpoint: item.endpoint,
-                  selected: selectedTimes.includes(item.time),
-                  'in-segment': mergeSegments.length > 0 && isInMergeSegment(item.time),
-                  locked: lockedTimeSet.has(item.time),
-                }"
-                @click="toggleSelection(item.time)"
-                @dblclick="openModalForTime(item.time)"
-              >
-                <div class="img-wrapper"><img v-if="item.src" :src="item.src" :alt="`縮圖 ${item.label}`" /><div v-else class="thumbnail-loading"><span></span><small>載入中</small></div><span v-if="item.endpoint" class="endpoint-label">{{ item.time === 0 ? '起點' : '終點' }}</span></div>
-                <div class="time-tag">{{ item.label }}</div>
+        <div v-if="hasPreviewContent" class="grid-shell">
+          <div ref="gridRef" class="grid-container" @scroll.passive="onGridScroll">
+            <div class="grid-virtual-canvas" :style="{ height: `${gridCanvasHeight}px` }">
+              <div class="grid-visible-rows" :style="{ top: `${gridFirstRow * gridRowPitch}px`, gridTemplateColumns: `repeat(${gridColumnCount}, minmax(0, 1fr))`, gridAutoRows: `${gridRowPitch - 3}px` }">
+                <div
+                  v-for="item in visibleGridItems"
+                  :key="`${item.time}-${item.index}`"
+                  class="grid-item-img"
+                  :class="{
+                    endpoint: item.endpoint,
+                    selected: selectedTimes.includes(item.time),
+                    'in-segment': mergeSegments.length > 0 && isInMergeSegment(item.time),
+                    locked: lockedTimeSet.has(item.time),
+                  }"
+                  @click="toggleSelection(item.time)"
+                  @dblclick="openModalForTime(item.time)"
+                >
+                  <div class="img-wrapper"><img v-if="item.src" :src="item.src" :alt="`縮圖 ${item.label}`" draggable="false" /><div v-else class="thumbnail-loading"><span></span><small>載入中</small></div><span v-if="item.endpoint" class="endpoint-label">{{ item.time === 0 ? '起點' : '終點' }}</span></div>
+                  <div class="time-tag">{{ item.label }}</div>
+                </div>
               </div>
             </div>
           </div>
+          <button v-if="showGridBackToTop" type="button" class="grid-back-to-top" title="回到縮圖列表頂端" aria-label="回到縮圖列表頂端" @click="scrollGridToTop">↑<span>回頂端</span></button>
         </div>
         <div v-else class="preview-placeholder">建立縮圖後會顯示在這裡。</div>
       </section>
@@ -2904,12 +2912,39 @@ select:focus {
   padding: 0.45rem 0.75rem;
   font-size: 0.8rem;
 }
-.grid-container {
+.grid-shell {
+  position: relative;
   flex: 1;
   min-height: 0;
+}
+.grid-container {
+  height: 100%;
   overflow-y: auto;
   padding: 3px;
   background: #020617;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.grid-back-to-top {
+  position: absolute;
+  left: 14px;
+  bottom: 14px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid rgba(165, 180, 252, 0.55);
+  border-radius: 999px;
+  color: #eef2ff;
+  background: rgba(30, 41, 59, 0.94);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.38);
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+}
+.grid-back-to-top:hover {
+  border-color: #a5b4fc;
+  background: rgba(55, 65, 81, 0.98);
 }
 .grid-virtual-canvas {
   position: relative;
@@ -2950,6 +2985,7 @@ select:focus {
   height: 100%;
   display: block;
   object-fit: cover;
+  -webkit-user-drag: none;
 }
 .thumbnail-loading,
 .modal-loading,

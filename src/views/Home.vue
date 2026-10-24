@@ -43,6 +43,11 @@ interface BatchSplitSource {
   error: string
 }
 
+interface SimilarThumbnailGroup {
+  id: number
+  times: number[]
+}
+
 type ExpansionMode = 'interval' | 'single' | 'count'
 type QueueStatus = '等待中' | '處理中' | '完成' | '失敗' | '已取消'
 type ModalImageSize = 'fit' | 'original'
@@ -275,6 +280,28 @@ const showGridBackToTop = computed(() => gridScrollTop.value > Math.max(240, gri
 const visibleGridItems = computed(() => gridSequence.value.slice(gridFirstRow.value * gridColumnCount.value, gridLastRow.value * gridColumnCount.value)
   .map((item, offset) => ({ ...item, index: gridFirstRow.value * gridColumnCount.value + offset })))
 const gridCanvasHeight = computed(() => gridTotalRows.value * gridRowPitch.value)
+const similarityLevel = ref<'strict' | 'normal' | 'loose'>('normal')
+const similarityMinCount = ref(3)
+const similarityPanelOpen = ref(false)
+const similarityAnalyzing = ref(false)
+const similarityProgress = ref(0)
+const similarityGroups = ref<SimilarThumbnailGroup[]>([])
+const similarityAnalyzedCount = ref(0)
+const hoveredSimilarityGroup = ref<number | null>(null)
+let similarityRunId = 0
+const similarityThreshold = computed(() => ({ strict: 3, normal: 7, loose: 12 })[similarityLevel.value])
+const similarityMetaByTime = computed(() => {
+  const result = new Map<number, { id: number; first: boolean; last: boolean }>()
+  for (const group of similarityGroups.value) {
+    group.times.forEach((time, index) => result.set(time, {
+      id: group.id,
+      first: index === 0,
+      last: index === group.times.length - 1,
+    }))
+  }
+  return result
+})
+const similarityResultOutdated = computed(() => Boolean(similarityGroups.value.length && similarityAnalyzedCount.value !== gridSequence.value.length))
 
 function measureGrid() {
   const container = gridRef.value
@@ -289,6 +316,143 @@ function onGridScroll() {
 
 function scrollGridToTop() {
   gridRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+function clearSimilarityAnalysis() {
+  similarityRunId += 1
+  similarityAnalyzing.value = false
+  similarityProgress.value = 0
+  similarityGroups.value = []
+  similarityAnalyzedCount.value = 0
+  hoveredSimilarityGroup.value = null
+}
+
+watch(videoPath, clearSimilarityAnalysis)
+
+function thumbnailDifference(first: Uint8Array, second: Uint8Array) {
+  let difference = 0
+  for (let index = 0; index < first.length; index += 1) if (first[index] !== second[index]) difference += 1
+  return difference
+}
+
+async function thumbnailHash(src: string, context: CanvasRenderingContext2D) {
+  const image = new Image()
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve()
+    image.onerror = () => reject(new Error('縮圖圖片無法讀取'))
+    image.src = src
+  })
+  context.drawImage(image, 0, 0, 9, 8)
+  const pixels = context.getImageData(0, 0, 9, 8).data
+  const hash = new Uint8Array(64)
+  for (let row = 0; row < 8; row += 1) {
+    for (let column = 0; column < 8; column += 1) {
+      const left = (row * 9 + column) * 4
+      const right = left + 4
+      const leftGray = pixels[left] * 0.299 + pixels[left + 1] * 0.587 + pixels[left + 2] * 0.114
+      const rightGray = pixels[right] * 0.299 + pixels[right + 1] * 0.587 + pixels[right + 2] * 0.114
+      hash[row * 8 + column] = leftGray > rightGray ? 1 : 0
+    }
+  }
+  return hash
+}
+
+async function analyzeSimilarThumbnails() {
+  if (similarityAnalyzing.value) return
+  const sequence = gridSequence.value.map((item) => ({ ...item }))
+  const minimumCount = Math.max(2, Math.min(100, Math.floor(Number(similarityMinCount.value) || 3)))
+  similarityMinCount.value = minimumCount
+  if (sequence.filter((item) => item.src).length < minimumCount) return addLog('已載入的縮圖數量不足，無法分析相似區段。')
+  const runId = ++similarityRunId
+  similarityAnalyzing.value = true
+  similarityProgress.value = 0
+  similarityGroups.value = []
+  const canvas = document.createElement('canvas')
+  canvas.width = 9
+  canvas.height = 8
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) {
+    similarityAnalyzing.value = false
+    return addLog('瀏覽器無法建立縮圖分析工具。')
+  }
+  const groups: SimilarThumbnailGroup[] = []
+  let currentTimes: number[] = []
+  let previousHash: Uint8Array | null = null
+  let anchorHash: Uint8Array | null = null
+  const finishGroup = () => {
+    if (currentTimes.length >= minimumCount) groups.push({ id: groups.length + 1, times: [...currentTimes] })
+    currentTimes = []
+    previousHash = null
+    anchorHash = null
+  }
+  try {
+    for (let index = 0; index < sequence.length; index += 1) {
+      if (runId !== similarityRunId) return
+      const item = sequence[index]
+      if (!item.src) {
+        finishGroup()
+      } else {
+        try {
+          const hash = await thumbnailHash(item.src, context)
+          const continues = previousHash && anchorHash
+            && thumbnailDifference(previousHash, hash) <= similarityThreshold.value
+            && thumbnailDifference(anchorHash, hash) <= similarityThreshold.value + 2
+          if (continues) currentTimes.push(item.time)
+          else {
+            finishGroup()
+            currentTimes = [item.time]
+            anchorHash = hash
+          }
+          previousHash = hash
+          if (!anchorHash) anchorHash = hash
+        } catch {
+          finishGroup()
+        }
+      }
+      similarityProgress.value = Math.round(((index + 1) / sequence.length) * 100)
+      if (index % 40 === 39) await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+    }
+    finishGroup()
+    if (runId !== similarityRunId) return
+    similarityGroups.value = groups
+    similarityAnalyzedCount.value = sequence.length
+    addLog(groups.length ? `相似縮圖分析完成：找到 ${groups.length} 個連續區段。` : '相似縮圖分析完成：沒有找到符合條件的連續區段。')
+  } finally {
+    if (runId === similarityRunId) similarityAnalyzing.value = false
+  }
+}
+
+function cancelSimilarityAnalysis() {
+  similarityRunId += 1
+  similarityAnalyzing.value = false
+  addLog('已取消相似縮圖分析。')
+}
+
+function selectSimilarityGroup(group: SimilarThumbnailGroup) {
+  if (!group.times.length) return
+  selectedTimes.value = [group.times[0], group.times[group.times.length - 1]]
+  const firstIndex = gridSequence.value.findIndex((item) => item.time === group.times[0])
+  if (firstIndex >= 0) {
+    const row = Math.floor(firstIndex / gridColumnCount.value)
+    gridRef.value?.scrollTo({ top: row * gridRowPitch.value, behavior: 'smooth' })
+  }
+}
+
+function similarityColorClass(groupId: number) {
+  return `similarity-color-${((groupId - 1) % 4) + 1}`
+}
+
+function similarityItemClasses(time: number) {
+  const meta = similarityMetaByTime.value.get(time)
+  if (!meta) return []
+  return [
+    'similar',
+    similarityColorClass(meta.id),
+    meta.first ? 'similar-first' : '',
+    meta.last ? 'similar-last' : '',
+    hoveredSimilarityGroup.value !== null && hoveredSimilarityGroup.value !== meta.id ? 'similar-muted' : '',
+    hoveredSimilarityGroup.value === meta.id ? 'similar-focused' : '',
+  ]
 }
 watch(gridRef, (element) => {
   gridResizeObserver?.disconnect()
@@ -552,6 +716,7 @@ function baseNameWithoutExt(path: string) {
 
 let unlistenDragDrop: (() => void) | null = null
 const infoHintWrap = ref<HTMLElement | null>(null)
+const similarityPopoverWrap = ref<HTMLElement | null>(null)
 
 function selectVideoFilePanel() {
   activePanel.value = 'load'
@@ -561,6 +726,9 @@ function selectVideoFilePanel() {
 function handleDocumentClick(event: MouseEvent) {
   if (showPreprocessHint.value && infoHintWrap.value && !infoHintWrap.value.contains(event.target as Node)) {
     showPreprocessHint.value = false
+  }
+  if (similarityPanelOpen.value && similarityPopoverWrap.value && !similarityPopoverWrap.value.contains(event.target as Node)) {
+    similarityPanelOpen.value = false
   }
 }
 
@@ -2141,6 +2309,58 @@ function createCombineTask() {
             <button class="btn btn-danger compact" @click="removeSelectedPreviewRange">移除範圍內縮圖（含兩端）</button>
             <button v-if="taskKind === 'merge'" class="btn btn-primary compact" @click="addSegmentToMergeList">＋ 加入合併清單</button>
           </template>
+          <div ref="similarityPopoverWrap" class="similarity-tool">
+            <button
+              type="button"
+              class="similarity-toggle"
+              :class="{ active: similarityPanelOpen }"
+              :aria-expanded="similarityPanelOpen"
+              @click="similarityPanelOpen = !similarityPanelOpen"
+            >
+              <span>相似縮圖</span>
+              <span v-if="similarityAnalyzing" class="similarity-toggle-status">{{ similarityProgress }}%</span>
+              <span v-else-if="similarityGroups.length" class="similarity-toggle-status">{{ similarityGroups.length }}</span>
+              <span>{{ similarityPanelOpen ? '▲' : '▼' }}</span>
+            </button>
+            <div v-if="similarityPanelOpen" class="similarity-panel" @click.stop>
+              <div class="similarity-controls">
+                <label>相似判定
+                  <select v-model="similarityLevel" :disabled="similarityAnalyzing">
+                    <option value="strict">嚴格</option>
+                    <option value="normal">一般</option>
+                    <option value="loose">寬鬆</option>
+                  </select>
+                </label>
+                <label>最少連續
+                  <input v-model.number="similarityMinCount" :disabled="similarityAnalyzing" type="number" min="2" max="100" step="1" /> 張
+                </label>
+                <button v-if="!similarityAnalyzing" type="button" class="btn btn-secondary compact" @click="analyzeSimilarThumbnails">分析相似縮圖</button>
+                <button v-else type="button" class="btn btn-danger compact" @click="cancelSimilarityAnalysis">取消分析（{{ similarityProgress }}%）</button>
+                <button v-if="similarityGroups.length && !similarityAnalyzing" type="button" class="btn-clear" @click="clearSimilarityAnalysis">清除結果</button>
+              </div>
+              <div v-if="similarityAnalyzing" class="similarity-progress"><span :style="{ width: `${similarityProgress}%` }"></span></div>
+              <p v-if="similarityResultOutdated" class="field-hint warning-text">縮圖數量已改變，目前標記可能已過期，建議重新分析。</p>
+              <div v-if="similarityGroups.length" class="similarity-results">
+                <strong>找到 {{ similarityGroups.length }} 個相似區段</strong>
+                <button
+                  v-for="group in similarityGroups"
+                  :key="group.id"
+                  type="button"
+                  class="similarity-result"
+                  :class="similarityColorClass(group.id)"
+                  @mouseenter="hoveredSimilarityGroup = group.id"
+                  @mouseleave="hoveredSimilarityGroup = null"
+                  @focus="hoveredSimilarityGroup = group.id"
+                  @blur="hoveredSimilarityGroup = null"
+                  @click="selectSimilarityGroup(group)"
+                >
+                  <span>區段 {{ group.id }}</span>
+                  <span>{{ formatSeconds(group.times[0]) }} → {{ formatSeconds(group.times[group.times.length - 1]) }}</span>
+                  <span>{{ group.times.length }} 張・選取頭尾</span>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
         <p class="info-text">點一下選取，點兩下檢視原圖。縮圖會依可用寬度自動排列；選取任意兩張後可移除範圍內所有縮圖。</p>
         <div v-if="workspaceRecovered" class="workspace-recovery">
@@ -2158,16 +2378,16 @@ function createCombineTask() {
                   v-for="item in visibleGridItems"
                   :key="`${item.time}-${item.index}`"
                   class="grid-item-img"
-                  :class="{
+                  :class="[{
                     endpoint: item.endpoint,
                     selected: selectedTimes.includes(item.time),
                     'in-segment': mergeSegments.length > 0 && isInMergeSegment(item.time),
                     locked: lockedTimeSet.has(item.time),
-                  }"
+                  }, similarityItemClasses(item.time)]"
                   @click="toggleSelection(item.time)"
                   @dblclick="openModalForTime(item.time)"
                 >
-                  <div class="img-wrapper"><img v-if="item.src" :src="item.src" :alt="`縮圖 ${item.label}`" draggable="false" /><div v-else class="thumbnail-loading"><span></span><small>載入中</small></div><span v-if="item.endpoint" class="endpoint-label">{{ item.time === 0 ? '起點' : '終點' }}</span></div>
+                  <div class="img-wrapper"><img v-if="item.src" :src="item.src" :alt="`縮圖 ${item.label}`" draggable="false" /><div v-else class="thumbnail-loading"><span></span><small>載入中</small></div><span v-if="item.endpoint" class="endpoint-label">{{ item.time === 0 ? '起點' : '終點' }}</span><span v-if="similarityMetaByTime.get(item.time)" class="similarity-badge">相似 {{ similarityMetaByTime.get(item.time)?.id }}</span></div>
                   <div class="time-tag">{{ item.label }}</div>
                 </div>
               </div>
@@ -2976,6 +3196,49 @@ select:focus {
 .grid-item-img.locked {
   box-shadow: inset 0 0 0 3px rgba(96, 165, 250, 0.85);
 }
+.similarity-color-1 { --similar-color: #c4b5fd; --similar-bg: #4c1d95; --similar-soft: rgba(124, 58, 237, 0.32); }
+.similarity-color-2 { --similar-color: #7dd3fc; --similar-bg: #075985; --similar-soft: rgba(14, 165, 233, 0.3); }
+.similarity-color-3 { --similar-color: #6ee7b7; --similar-bg: #065f46; --similar-soft: rgba(16, 185, 129, 0.28); }
+.similarity-color-4 { --similar-color: #fdba74; --similar-bg: #9a3412; --similar-soft: rgba(249, 115, 22, 0.3); }
+.grid-item-img.similar {
+  position: relative;
+  transition: opacity 0.15s ease, filter 0.15s ease;
+}
+.grid-item-img.similar .time-tag {
+  color: #fff;
+  background: var(--similar-bg);
+}
+.grid-item-img.similar-first::before,
+.grid-item-img.similar-last::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 2;
+  width: 4px;
+  content: '';
+  background: var(--similar-color);
+  pointer-events: none;
+}
+.grid-item-img.similar-first::before { left: 0; }
+.grid-item-img.similar-last::after { right: 0; }
+.grid-item-img.similar-muted { opacity: 0.38; }
+.grid-item-img.similar-focused { filter: brightness(1.16); }
+.similarity-badge {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  z-index: 3;
+  padding: 0.15rem 0.35rem;
+  border: 1px solid var(--similar-color);
+  border-radius: 999px;
+  color: #fff;
+  background: var(--similar-bg);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+  font-size: 0.62rem;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
 .img-wrapper {
   position: relative;
   height: calc(100% - 22px);
@@ -3065,6 +3328,8 @@ select:focus {
   flex-shrink: 0;
 }
 .current-layout-controls {
+  position: relative;
+  z-index: 12;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -3090,6 +3355,118 @@ select:focus {
   width: 5rem;
   font-variant-numeric: tabular-nums;
 }
+.similarity-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  z-index: 20;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.98);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(10px);
+}
+.similarity-tool {
+  display: flex;
+  margin-left: auto;
+}
+.similarity-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2rem;
+  padding: 0.4rem 0.65rem;
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-radius: 7px;
+  color: #ddd6fe;
+  background: rgba(76, 29, 149, 0.1);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.similarity-toggle:hover,
+.similarity-toggle.active {
+  border-color: rgba(167, 139, 250, 0.65);
+  background: rgba(76, 29, 149, 0.2);
+}
+.similarity-toggle-status {
+  padding: 0.16rem 0.45rem;
+  border-radius: 999px;
+  color: #ede9fe;
+  background: rgba(139, 92, 246, 0.35);
+  font-size: 0.7rem;
+}
+.similarity-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+}
+.similarity-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+.similarity-controls select {
+  width: auto;
+  min-width: 5rem;
+  padding: 0.4rem 0.55rem;
+}
+.similarity-controls input {
+  width: 4rem;
+  padding: 0.4rem 0.5rem;
+}
+.similarity-progress {
+  height: 5px;
+  margin-top: 0.6rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+.similarity-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #8b5cf6;
+  transition: width 0.15s ease;
+}
+.similarity-results {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+  padding-bottom: 0.2rem;
+  overflow-x: auto;
+}
+.similarity-results > strong {
+  align-self: center;
+  flex: 0 0 auto;
+  margin-right: 0.2rem;
+  color: #ddd6fe;
+  font-size: 0.78rem;
+}
+.similarity-result {
+  display: inline-flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 0.12rem;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid var(--similar-color);
+  border-radius: 7px;
+  color: #fff;
+  background: var(--similar-bg);
+  font-size: 0.7rem;
+  text-align: left;
+  cursor: pointer;
+}
+.similarity-result:hover {
+  box-shadow: 0 0 0 2px var(--similar-soft);
+  filter: brightness(1.15);
+}
+.warning-text { color: #fbbf24; }
 .row-divider {
   opacity: 0.4;
 }

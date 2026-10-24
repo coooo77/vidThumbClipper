@@ -28,6 +28,8 @@ export interface VideoTask {
   source: string
   segments: VideoSegment[]
   durationHours: number
+  durationMinutes?: number
+  durationSeconds?: number
   splitCount: number
   outputName: string
   extension: string

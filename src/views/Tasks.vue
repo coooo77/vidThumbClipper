@@ -5,7 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { useRouter } from 'vue-router'
 import { queueTaskEdit, videoTasks, type VideoSegment, type VideoTask } from '../taskStore'
 import { getNotifySettings, notifyResult } from '../notify'
-import { buildClipRanges, directoryOf, formatTimecode, resolveTaskOutputFolder, taskDestination } from '../videoUtils'
+import { buildClipRanges, directoryOf, formatTimecode, resolveTaskOutputFolder, taskDestination, taskSegmentDurationSeconds } from '../videoUtils'
 
 const ffmpegPath = ref('')
 const ffprobePath = ref('')
@@ -203,10 +203,11 @@ function taskEtaText(task: VideoTask) {
 function taskSummary(task: VideoTask) {
   if (task.kind === 'preprocess') return '整支影片 remux 為 mp4'
   if (task.kind === 'combine') return `${task.combineSources.length} 支影片・${task.combineMode === 'copy' ? '快速合併' : '相容合併'}`
-  if (task.kind === 'merge') return `${task.segments.length} 個片段`
-  if (task.method === 'duration') return `每 ${task.durationHours} 小時分割`
-  if (task.method === 'count') return `平均分割 ${task.splitCount} 段`
-  return `${formatTimecode(task.segments[0]?.start || 0)} → ${formatTimecode(task.segments[0]?.end || 0)}`
+  const seekMode = task.preciseSeek ? '精細定位' : '快速定位'
+  if (task.kind === 'merge') return `${task.segments.length} 個片段・${seekMode}`
+  if (task.method === 'duration') return `每 ${formatTimecode(taskSegmentDurationSeconds(task))} 分割${task.segments.length ? `・共 ${task.segments.length} 段` : ''}・${seekMode}`
+  if (task.method === 'count') return `平均分割 ${task.splitCount} 段・${seekMode}`
+  return `${formatTimecode(task.segments[0]?.start || 0)} → ${formatTimecode(task.segments[0]?.end || 0)}・${seekMode}`
 }
 
 function taskRanges(task: VideoTask): VideoSegment[] {
@@ -395,10 +396,11 @@ async function throwIfBatchStopLatched(task: VideoTask) {
   throw new Error('Task stopped by user')
 }
 async function clipRange(task: VideoTask, range: VideoSegment, path: string, completedBefore: number) {
+  const duration = Math.max(0.001, range.end - range.start)
   const args = task.preciseSeek
-    ? ['-i', task.source, '-ss', range.start.toFixed(3), '-to', range.end.toFixed(3), '-c', 'copy', path, '-y']
-    : ['-ss', range.start.toFixed(3), '-i', task.source, '-to', range.end.toFixed(3), '-c', 'copy', path, '-y']
-  const ffmpegOutput = await runFfmpegWithProgress(task, args, completedBefore, Math.max(0.001, range.end - range.start))
+    ? ['-i', task.source, '-ss', range.start.toFixed(3), '-t', duration.toFixed(3), '-c', 'copy', path, '-y']
+    : ['-ss', range.start.toFixed(3), '-i', task.source, '-t', duration.toFixed(3), '-c', 'copy', path, '-y']
+  const ffmpegOutput = await runFfmpegWithProgress(task, args, completedBefore, duration)
   throwIfStopRequested(task)
   const expected = range.end - range.start
   // A truncated/broken copy can still end up with a container header that claims the requested

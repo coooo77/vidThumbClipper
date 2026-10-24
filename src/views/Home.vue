@@ -18,7 +18,7 @@ import {
   type VideoTask,
 } from '../taskStore'
 import { clearWorkspaceDraft, loadWorkspaceDraft, saveWorkspaceDraft } from '../workspaceStore'
-import { directoryOf as dirName, formatTimecode as formatSeconds } from '../videoUtils'
+import { directoryOf as dirName, formatTimecode as formatSeconds, taskSegmentDurationSeconds } from '../videoUtils'
 import {
   getThumbnailSettings,
   isLegacyFastSettings,
@@ -34,6 +34,13 @@ interface ThumbnailItem {
   time: number
   timeStr: string
   base64: string
+}
+
+interface BatchSplitSource {
+  path: string
+  duration: number
+  loading: boolean
+  error: string
 }
 
 type ExpansionMode = 'interval' | 'single' | 'count'
@@ -121,15 +128,19 @@ const showDeleteProcessedConfirm = ref(false)
 const isDeletingProcessed = ref(false)
 const router = useRouter()
 const taskKind = ref<TaskKind>('clip')
-const taskSourceMode = ref<'original' | 'processed'>('original')
+const taskSourceMode = ref<'original' | 'processed' | 'batch'>('original')
 const taskSourceProcessedId = ref('')
+const batchSplitSources = ref<BatchSplitSource[]>([])
 const taskSourcePath = computed(() => {
+  if (taskSourceMode.value === 'batch') return ''
   if (taskSourceMode.value === 'processed') {
     const match = processedVideos.value.find((task) => task.id === taskSourceProcessedId.value)
     return match?.resultPath || ''
   }
   return originalSourcePath.value
 })
+const batchSourceModeAvailable = computed(() => taskKind.value === 'clip' && taskMethod.value !== 'range' && !editingTaskId.value)
+const batchSourcesReady = computed(() => batchSplitSources.value.length > 0 && batchSplitSources.value.every((source) => !source.loading && !source.error && source.duration > 0))
 // The default output name should always reflect whichever source is actually selected (original vs.
 // a specific processed video) — otherwise switching sources can leave a misleading filename behind
 // from whatever was loaded first, even though the correct file is the one actually used to cut.
@@ -138,6 +149,8 @@ watch(taskSourcePath, (path) => {
 })
 const taskMethod = ref<ClipMethod>('range')
 const taskDurationHours = ref(6)
+const taskDurationMinutes = ref(0)
+const taskDurationSeconds = ref(0)
 const taskSplitCount = ref(5)
 const mergeSegments = ref<VideoSegment[]>([])
 const taskNameSuffix = ref('_edit')
@@ -147,9 +160,39 @@ const taskExtension = ref('mp4')
 const taskExtraArgs = ref('')
 const taskPreciseSeek = ref(true)
 const taskKeepSegments = ref(false)
+const configuredSegmentDuration = computed(() => taskSegmentDurationSeconds({
+  durationHours: taskDurationHours.value,
+  durationMinutes: taskDurationMinutes.value,
+  durationSeconds: taskDurationSeconds.value,
+}))
+const durationInputIsValid = computed(() => {
+  const hours = Number(taskDurationHours.value)
+  const minutes = Number(taskDurationMinutes.value)
+  const seconds = Number(taskDurationSeconds.value)
+  return [hours, minutes, seconds].every(Number.isFinite)
+    && Number.isInteger(hours) && hours >= 0
+    && Number.isInteger(minutes) && minutes >= 0 && minutes <= 59
+    && Number.isInteger(seconds) && seconds >= 0 && seconds <= 59
+})
+const durationSplitCount = computed(() => {
+  const segmentDuration = configuredSegmentDuration.value
+  const duration = videoDuration.value
+  return segmentDuration && duration ? Math.ceil(duration / segmentDuration) : 0
+})
+const visibleDurationSplitPreview = computed(() => {
+  const count = durationSplitCount.value
+  const indexes = count <= 8 ? Array.from({ length: count }, (_, index) => index) : [...Array.from({ length: 7 }, (_, index) => index), count - 1]
+  return indexes.map((index) => ({
+    start: index * configuredSegmentDuration.value,
+    end: Math.min(videoDuration.value, (index + 1) * configuredSegmentDuration.value),
+  }))
+})
 const editingTaskId = ref<string | null>(null)
 const editingCreatesCopy = ref(false)
 const editingTask = computed(() => (editingTaskId.value ? videoTasks.find((task) => task.id === editingTaskId.value) ?? null : null))
+watch([taskKind, taskMethod], () => {
+  if (taskSourceMode.value === 'batch' && !batchSourceModeAvailable.value) taskSourceMode.value = 'original'
+})
 
 // Requires exactly two ADJACENT thumbnails (by CURRENT array position — resolved live, since another
 // job inserting thumbnails elsewhere can shift indices while this selection is still pending) — only
@@ -381,7 +424,12 @@ function restoreSavedWorkspace() {
   initialInterval.value = Math.max(0.1, Number(draft.initialInterval) || 4)
   taskKind.value = draft.taskKind === 'merge' ? 'merge' : 'clip'
   taskMethod.value = ['range', 'duration', 'count'].includes(draft.taskMethod) ? draft.taskMethod : 'range'
-  taskDurationHours.value = Math.max(0.1, Number(draft.taskDurationHours) || 6)
+  const savedSegmentSeconds = draft.taskDurationMinutes === undefined && draft.taskDurationSeconds === undefined
+    ? Math.max(1, Math.round((Number(draft.taskDurationHours) || 6) * 3600))
+    : Math.max(1, Math.floor(Number(draft.taskDurationHours) || 0) * 3600 + Math.floor(Number(draft.taskDurationMinutes) || 0) * 60 + Math.floor(Number(draft.taskDurationSeconds) || 0))
+  taskDurationHours.value = Math.floor(savedSegmentSeconds / 3600)
+  taskDurationMinutes.value = Math.floor((savedSegmentSeconds % 3600) / 60)
+  taskDurationSeconds.value = savedSegmentSeconds % 60
   taskSplitCount.value = Math.max(2, Math.floor(Number(draft.taskSplitCount) || 5))
   taskOutputName.value = draft.taskOutputName || `${baseNameWithoutExt(draft.videoPath)}${taskNameSuffix.value}`
   taskOutputNameAuto.value = !draft.taskOutputName
@@ -425,6 +473,8 @@ function scheduleWorkspaceSave() {
       taskKind: taskKind.value,
       taskMethod: taskMethod.value,
       taskDurationHours: taskDurationHours.value,
+      taskDurationMinutes: taskDurationMinutes.value,
+      taskDurationSeconds: taskDurationSeconds.value,
       taskSplitCount: taskSplitCount.value,
       taskOutputName: taskOutputName.value,
       taskExtension: taskExtension.value,
@@ -437,7 +487,7 @@ function scheduleWorkspaceSave() {
 
 watch([
   videoPath, originalSourcePath, videoDuration, initialCaptureMode, initialThumbnailCount, initialInterval, previewColumns,
-  taskKind, taskMethod, taskDurationHours, taskSplitCount, taskOutputName, taskExtension, taskExtraArgs,
+  taskKind, taskMethod, taskDurationHours, taskDurationMinutes, taskDurationSeconds, taskSplitCount, taskOutputName, taskExtension, taskExtraArgs,
   taskPreciseSeek, taskKeepSegments, showStartEndpoint, showEndEndpoint,
   () => thumbnails.value.map((item) => item.time).join(','),
   () => selectedTimes.value.join(','),
@@ -761,6 +811,8 @@ function queuePreprocessTasks(paths: string[]) {
       source: path,
       segments: [],
       durationHours: taskDurationHours.value,
+      durationMinutes: taskDurationMinutes.value,
+      durationSeconds: taskDurationSeconds.value,
       splitCount: taskSplitCount.value,
       outputName: `${baseNameWithoutExt(path)}_preprocessed`,
       extension: 'mp4',
@@ -1157,7 +1209,10 @@ async function restoreTaskForEditing(taskId: string) {
   gridScrollTop.value = 0
   taskKind.value = task.kind
   taskMethod.value = task.method
-  taskDurationHours.value = task.durationHours
+  const segmentDuration = taskSegmentDurationSeconds(task)
+  taskDurationHours.value = Math.floor(segmentDuration / 3600)
+  taskDurationMinutes.value = Math.floor((segmentDuration % 3600) / 60)
+  taskDurationSeconds.value = Math.floor(segmentDuration % 60)
   taskSplitCount.value = task.splitCount
   taskOutputName.value = editingCreatesCopy.value ? `${task.outputName}${taskNameSuffix.value}` : task.outputName
   taskOutputNameAuto.value = false
@@ -1453,7 +1508,7 @@ function buildCalculatedClipSegments(method: ClipMethod): VideoSegment[] {
   const duration = videoDuration.value
   if (!Number.isFinite(duration) || duration <= 0) return []
   if (method === 'duration') {
-    const segmentDuration = Number(taskDurationHours.value) * 3600
+    const segmentDuration = configuredSegmentDuration.value
     if (!Number.isFinite(segmentDuration) || segmentDuration <= 0) return []
     return Array.from({ length: Math.ceil(duration / segmentDuration) }, (_, index) => ({
       start: index * segmentDuration,
@@ -1479,6 +1534,8 @@ function saveTaskFromEditor(kind: 'clip' | 'merge', segments: VideoSegment[]) {
     source: taskSourcePath.value,
     segments: segments.map((segment) => ({ start: roundPreviewTime(segment.start), end: roundPreviewTime(segment.end) })),
     durationHours: taskDurationHours.value,
+    durationMinutes: taskDurationMinutes.value,
+    durationSeconds: taskDurationSeconds.value,
     splitCount: taskSplitCount.value,
     outputName: taskOutputName.value.trim() || (kind === 'clip' ? 'clip' : 'merged_video'),
     extension: taskExtension.value.trim() || 'mp4',
@@ -1511,14 +1568,15 @@ function saveTaskFromEditor(kind: 'clip' | 'merge', segments: VideoSegment[]) {
 }
 
 function createClipTask() {
+  if (taskSourceMode.value === 'batch') return createBatchClipTasks()
   if (!taskSourcePath.value) return addLog('請先選擇影片檔案，或選擇要使用的已處理影片。')
   let segments: VideoSegment[] = []
   if (taskMethod.value === 'range') {
     if (!selectedTimeRange.value) return addLog('請先在縮圖中選擇兩個時間點作為剪輯範圍。')
     segments = [{ start: selectedTimeRange.value.start, end: selectedTimeRange.value.end }]
   } else {
-    if (taskMethod.value === 'duration' && (!Number.isFinite(Number(taskDurationHours.value)) || Number(taskDurationHours.value) <= 0)) {
-      return addLog('請輸入有效的分段時間長度。')
+    if (taskMethod.value === 'duration' && (!durationInputIsValid.value || configuredSegmentDuration.value <= 0)) {
+      return addLog('請輸入有效的分段時間長度；分鐘與秒鐘必須介於 0 到 59。')
     }
     if (taskMethod.value === 'count' && (!Number.isFinite(Number(taskSplitCount.value)) || Number(taskSplitCount.value) < 2)) {
       return addLog('分割數量至少需要 2 段。')
@@ -1526,6 +1584,99 @@ function createClipTask() {
     segments = buildCalculatedClipSegments(taskMethod.value)
   }
   saveTaskFromEditor('clip', segments)
+}
+
+function batchSplitCount(source: BatchSplitSource) {
+  if (!source.duration) return 0
+  if (taskMethod.value === 'duration') return configuredSegmentDuration.value > 0 ? Math.ceil(source.duration / configuredSegmentDuration.value) : 0
+  return taskMethod.value === 'count' ? Math.max(1, Math.floor(Number(taskSplitCount.value) || 1)) : 0
+}
+
+async function selectBatchSplitVideos() {
+  const selected = await open({
+    multiple: true,
+    directory: false,
+    title: '選擇要套用相同設定的影片',
+    filters: [{ name: 'Video', extensions: ['mp4', 'mkv', 'avi', 'mov', 'flv', 'webm', 'm4v', 'ts', 'mpeg', 'mpg', 'wmv'] }],
+  })
+  const paths = Array.isArray(selected) ? selected : typeof selected === 'string' ? [selected] : []
+  const existing = new Set(batchSplitSources.value.map((source) => normaliseVideoPath(source.path)))
+  const additions = paths
+    .filter((path) => {
+      const key = normaliseVideoPath(path)
+      if (existing.has(key)) return false
+      existing.add(key)
+      return true
+    })
+    .map((path) => ({ path, duration: 0, loading: true, error: '' }))
+  batchSplitSources.value.push(...additions)
+  for (const source of additions) {
+    try {
+      source.duration = await invoke<number>('get_video_duration', { ffprobePath: ffprobePath.value || null, videoPath: source.path })
+    } catch (error) {
+      source.error = String(error)
+    } finally {
+      source.loading = false
+    }
+  }
+}
+
+function removeBatchSplitSource(index: number) {
+  batchSplitSources.value.splice(index, 1)
+}
+
+function moveBatchSplitSource(index: number, direction: -1 | 1) {
+  const target = index + direction
+  if (target < 0 || target >= batchSplitSources.value.length) return
+  const [source] = batchSplitSources.value.splice(index, 1)
+  batchSplitSources.value.splice(target, 0, source)
+}
+
+function createBatchClipTasks() {
+  if (!batchSourceModeAvailable.value) return addLog('批次分割只適用於時間長度或依數量分割。')
+  if (!batchSourcesReady.value) return addLog('請先選擇影片，並等待所有影片長度讀取完成。')
+  if (taskMethod.value === 'duration' && (!durationInputIsValid.value || configuredSegmentDuration.value <= 0)) {
+    return addLog('請輸入有效的分段時間長度；分鐘與秒鐘必須介於 0 到 59。')
+  }
+  if (taskMethod.value === 'count' && (!Number.isFinite(Number(taskSplitCount.value)) || Number(taskSplitCount.value) < 2)) {
+    return addLog('分割數量至少需要 2 段。')
+  }
+  const outputNames = batchSplitSources.value.map((source) => `${baseNameWithoutExt(source.path)}${taskNameSuffix.value}.${taskExtension.value.trim() || 'mp4'}`.toLowerCase())
+  if (new Set(outputNames).size !== outputNames.length) {
+    return addLog('批次影片中有重複的輸出檔名。請移除同名來源，或分開建立任務，避免輸出互相覆蓋。')
+  }
+  for (const source of batchSplitSources.value) {
+    const segmentDuration = configuredSegmentDuration.value
+    const segmentCount = taskMethod.value === 'duration' ? Math.ceil(source.duration / segmentDuration) : Math.max(1, Math.floor(taskSplitCount.value))
+    const segments = Array.from({ length: segmentCount }, (_, index) => taskMethod.value === 'duration'
+      ? { start: index * segmentDuration, end: Math.min(source.duration, (index + 1) * segmentDuration) }
+      : { start: (source.duration * index) / segmentCount, end: (source.duration * (index + 1)) / segmentCount })
+    videoTasks.push({
+      id: newTaskId(),
+      kind: 'clip',
+      method: taskMethod.value,
+      source: source.path,
+      segments: segments.map((segment) => ({ start: roundPreviewTime(segment.start), end: roundPreviewTime(segment.end) })),
+      durationHours: taskDurationHours.value,
+      durationMinutes: taskDurationMinutes.value,
+      durationSeconds: taskDurationSeconds.value,
+      splitCount: taskSplitCount.value,
+      outputName: `${baseNameWithoutExt(source.path)}${taskNameSuffix.value}`,
+      extension: taskExtension.value.trim() || 'mp4',
+      extraArgs: taskExtraArgs.value,
+      keepSegments: false,
+      outputDir: '',
+      resultPath: '',
+      preciseSeek: taskPreciseSeek.value,
+      combineSources: [],
+      combineMode: 'copy',
+      status: '等待中',
+      message: '',
+    })
+  }
+  addLog(`已建立 ${batchSplitSources.value.length} 筆批次分割任務。`)
+  batchSplitSources.value = []
+  router.push('/tasks')
 }
 
 function createMergeTask() {
@@ -1570,6 +1721,8 @@ function createCombineTask() {
     source: combineFiles.value[0],
     segments: [],
     durationHours: taskDurationHours.value,
+    durationMinutes: taskDurationMinutes.value,
+    durationSeconds: taskDurationSeconds.value,
     splitCount: taskSplitCount.value,
     outputName: combineOutputName.value.trim() || 'merged_video',
     extension: combineExtension.value.trim() || 'mp4',
@@ -1815,12 +1968,34 @@ function createCombineTask() {
             <label :class="{ muted: !processedVideos.length }"
               ><input v-model="taskSourceMode" type="radio" value="processed" :disabled="!processedVideos.length" /> 已處理影片</label
             >
+            <label v-if="batchSourceModeAvailable"><input v-model="taskSourceMode" type="radio" value="batch" /> 多個影片（批次）</label>
           </div>
           <select v-if="taskSourceMode === 'processed'" v-model="taskSourceProcessedId">
             <option value="" disabled>請選擇已處理影片</option>
             <option v-for="task in processedVideos" :key="task.id" :value="task.id">{{ task.outputName }}.{{ task.extension }}</option>
           </select>
-          <p class="selection-summary break-all" :class="{ muted: !taskSourcePath }">
+          <div v-if="taskSourceMode === 'batch'" class="batch-source-panel">
+            <div class="batch-source-actions">
+              <button type="button" class="btn btn-secondary compact" @click="selectBatchSplitVideos">選擇多支影片</button>
+              <button v-if="batchSplitSources.length" type="button" class="btn-clear" @click="batchSplitSources = []">清空</button>
+            </div>
+            <div v-if="batchSplitSources.length" class="batch-source-list">
+              <div v-for="(source, index) in batchSplitSources" :key="source.path" class="batch-source-item">
+                <span class="batch-source-index">{{ index + 1 }}</span>
+                <div class="batch-source-info">
+                  <strong :title="source.path">{{ baseName(source.path) }}</strong>
+                  <span v-if="source.loading">正在讀取影片長度…</span>
+                  <span v-else-if="source.error" class="batch-source-error">無法讀取：{{ source.error }}</span>
+                  <span v-else>{{ formatSeconds(source.duration) }}・預計 {{ batchSplitCount(source) }} 段</span>
+                </div>
+                <button type="button" class="btn-clear" :disabled="index === 0" aria-label="向上移動" @click="moveBatchSplitSource(index, -1)">↑</button>
+                <button type="button" class="btn-clear" :disabled="index === batchSplitSources.length - 1" aria-label="向下移動" @click="moveBatchSplitSource(index, 1)">↓</button>
+                <button type="button" class="btn-clear danger-text" @click="removeBatchSplitSource(index)">移除</button>
+              </div>
+            </div>
+            <p v-else class="selection-summary muted">尚未選擇批次分割影片；不會切換目前預覽中的影片。</p>
+          </div>
+          <p v-else class="selection-summary break-all" :class="{ muted: !taskSourcePath }">
             {{ taskSourcePath ? `將對「${baseName(taskSourcePath)}」${editingTaskId ? '儲存修改' : '建立任務'}` : '尚未選擇來源影片' }}
           </p>
         </div>
@@ -1837,8 +2012,22 @@ function createCombineTask() {
             }}
           </p>
           <div v-else-if="taskMethod === 'duration'" class="input-group">
-            <label>每段時間長度（小時）</label>
-            <input v-model.number="taskDurationHours" type="number" min="0.1" step="0.5" />
+            <label>每段時間長度</label>
+            <div class="duration-input-grid">
+              <label><input v-model.number="taskDurationHours" type="number" min="0" step="1" /> 小時</label>
+              <label><input v-model.number="taskDurationMinutes" type="number" min="0" max="59" step="1" /> 分鐘</label>
+              <label><input v-model.number="taskDurationSeconds" type="number" min="0" max="59" step="1" /> 秒</label>
+            </div>
+            <div v-if="durationSplitCount" class="duration-split-preview">
+              <strong>預計輸出 {{ durationSplitCount }} 段</strong>
+              <p v-if="configuredSegmentDuration >= videoDuration">設定長度大於或等於影片長度，因此只會輸出一個完整片段。</p>
+              <ol>
+                <li v-for="(segment, index) in visibleDurationSplitPreview" :key="`${segment.start}-${segment.end}`">
+                  <span v-if="durationSplitCount > 8 && index === 7">… 最後一段：</span>{{ formatSeconds(segment.start) }} → {{ formatSeconds(segment.end) }}
+                </li>
+              </ol>
+            </div>
+            <p v-else class="field-hint">時間長度必須大於 0；最後不足指定長度的部分仍會保留。</p>
           </div>
           <div v-else class="input-group">
             <label>平均分割數量</label>
@@ -1868,15 +2057,26 @@ function createCombineTask() {
           <label class="checkbox-row"><input v-model="taskKeepSegments" type="checkbox" /> 合併後保留個別剪輯片段</label>
         </template>
 
-        <div class="row">
+        <div v-if="taskSourceMode !== 'batch'" class="row">
           <div class="col input-group"><label>輸出檔名</label><input v-model="taskOutputName" @input="taskOutputNameAuto = false" /></div>
           <div class="col input-group"><label>副檔名</label><input v-model="taskExtension" /></div>
         </div>
+        <div v-else class="input-group">
+          <label>輸出副檔名</label><input v-model="taskExtension" />
+          <p class="field-hint">輸出檔名會使用各來源檔名加上「{{ taskNameSuffix }}」，每個分段再附加流水號。</p>
+        </div>
         <div class="input-group"><label>額外 ffmpeg 參數（合併時套用，以空白分隔）</label><input v-model="taskExtraArgs" placeholder="例如：-crf 20" /></div>
-        <label class="checkbox-row"><input v-model="taskPreciseSeek" type="checkbox" /> 精確 seek（較慢，適合時間戳異常的長時間錄影）</label>
+        <div class="input-group">
+          <label>切割定位方式</label>
+          <select v-model="taskPreciseSeek">
+            <option :value="false">快速定位（建議，適合長影片）</option>
+            <option :value="true">精細定位（較慢，適合時間戳異常的影片）</option>
+          </select>
+          <p class="field-hint">兩種方式都不會重新編碼，速度較快；切點仍受關鍵影格限制，可能有數秒誤差。</p>
+        </div>
 
         <button v-if="taskKind === 'clip'" class="btn btn-primary btn-glow w-full" @click="createClipTask">
-          {{ editingTaskId ? (editingCreatesCopy ? '另存新的剪輯任務' : '儲存剪輯任務修改') : '建立剪輯任務' }}
+          {{ taskSourceMode === 'batch' ? `建立 ${batchSplitSources.length} 筆分割任務` : editingTaskId ? (editingCreatesCopy ? '另存新的剪輯任務' : '儲存剪輯任務修改') : '建立剪輯任務' }}
         </button>
         <button v-else class="btn btn-primary btn-glow w-full" :disabled="mergeSegments.length < 2" @click="createMergeTask">
           {{ editingTaskId ? (editingCreatesCopy ? '另存新的剪輯＋合併任務' : '儲存剪輯＋合併任務修改') : '建立剪輯＋合併任務' }}
@@ -2404,6 +2604,35 @@ select:focus {
 .mode-row input {
   margin-right: 0.35rem;
 }
+.duration-input-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+.duration-input-grid label {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+}
+.duration-split-preview {
+  margin-top: 0.8rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.4);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+.duration-split-preview strong { color: var(--text-color); }
+.duration-split-preview p { margin: 0.35rem 0 0; }
+.duration-split-preview ol {
+  margin: 0.55rem 0 0;
+  padding-left: 1.4rem;
+  font-family: ui-monospace, monospace;
+  line-height: 1.55;
+}
 .quick-set-row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(4rem, 1fr));
@@ -2462,6 +2691,55 @@ select:focus {
   gap: 0.5rem;
   margin: 0 0 1rem;
 }
+.batch-source-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+.batch-source-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+.batch-source-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.batch-source-item {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.45);
+}
+.batch-source-index {
+  flex: 0 0 1.5rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+.batch-source-info {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.18rem;
+}
+.batch-source-info strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.batch-source-info span {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+.batch-source-info .batch-source-error,
+.danger-text { color: #fca5a5; }
 .merge-item {
   display: flex;
   align-items: center;

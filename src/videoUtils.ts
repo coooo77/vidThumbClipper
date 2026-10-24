@@ -26,11 +26,22 @@ export function taskDestination(task: VideoTask, globalOutputDirectory: string, 
   return `${resolveTaskOutputFolder(task, globalOutputDirectory)}${task.outputName}${suffix}.${task.extension.replace(/^\./, '')}`
 }
 
+export function taskSegmentDurationSeconds(task: Pick<VideoTask, 'durationHours' | 'durationMinutes' | 'durationSeconds'>) {
+  // Older tasks stored a possibly fractional hour value and have no minute/second fields.
+  if (task.durationMinutes === undefined && task.durationSeconds === undefined) {
+    return Math.max(0, Number(task.durationHours) || 0) * 3600
+  }
+  const hours = Math.max(0, Math.floor(Number(task.durationHours) || 0))
+  const minutes = Math.max(0, Math.min(59, Math.floor(Number(task.durationMinutes) || 0)))
+  const seconds = Math.max(0, Math.min(59, Math.floor(Number(task.durationSeconds) || 0)))
+  return hours * 3600 + minutes * 60 + seconds
+}
+
 export function buildClipRanges(task: VideoTask, knownDuration = task.previewTimeline?.duration || 0): VideoSegment[] {
   if (task.segments.length) return task.segments
   if (!knownDuration || task.kind !== 'clip') return []
   if (task.method === 'duration') {
-    const segmentDuration = task.durationHours * 3600
+    const segmentDuration = taskSegmentDurationSeconds(task)
     if (segmentDuration <= 0) return []
     return Array.from({ length: Math.ceil(knownDuration / segmentDuration) }, (_, index) => ({
       start: index * segmentDuration,

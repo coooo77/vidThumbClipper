@@ -19,6 +19,8 @@ export interface WorkspaceDraft {
   taskKind: TaskKind
   taskMethod: ClipMethod
   taskDurationHours: number
+  taskDurationMinutes?: number
+  taskDurationSeconds?: number
   taskSplitCount: number
   taskOutputName: string
   taskExtension: string

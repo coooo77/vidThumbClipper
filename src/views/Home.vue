@@ -51,6 +51,7 @@ interface SimilarThumbnailGroup {
 type ExpansionMode = 'interval' | 'single' | 'count'
 type QueueStatus = '等待中' | '處理中' | '完成' | '失敗' | '已取消'
 type ModalImageSize = 'fit' | 'original'
+type SimilarityKeepMode = 'front' | 'back' | 'both'
 
 interface ExpansionJob {
   id: string
@@ -158,6 +159,7 @@ const taskDurationMinutes = ref(0)
 const taskDurationSeconds = ref(0)
 const taskSplitCount = ref(5)
 const mergeSegments = ref<VideoSegment[]>([])
+const mergeEditingIndex = ref<number | null>(null)
 const taskNameSuffix = ref('_edit')
 const taskOutputName = ref('processed_video')
 const taskOutputNameAuto = ref(true)
@@ -288,6 +290,11 @@ const similarityProgress = ref(0)
 const similarityGroups = ref<SimilarThumbnailGroup[]>([])
 const similarityAnalyzedCount = ref(0)
 const hoveredSimilarityGroup = ref<number | null>(null)
+const selectedSimilarityGroupIds = ref<number[]>([])
+const similarityKeepMode = ref<SimilarityKeepMode>('both')
+const similarityKeepCount = ref(1)
+const showSimilarityMarkers = ref(true)
+const showSmartReplaceConfirm = ref(false)
 let similarityRunId = 0
 const similarityThreshold = computed(() => ({ strict: 3, normal: 7, loose: 12 })[similarityLevel.value])
 const similarityMetaByTime = computed(() => {
@@ -302,6 +309,41 @@ const similarityMetaByTime = computed(() => {
   return result
 })
 const similarityResultOutdated = computed(() => Boolean(similarityGroups.value.length && similarityAnalyzedCount.value !== gridSequence.value.length))
+const smartRemovalPlan = computed(() => {
+  const keepCount = Math.max(1, Math.floor(Number(similarityKeepCount.value) || 1))
+  const enabledIds = new Set(selectedSimilarityGroupIds.value)
+  return similarityGroups.value.filter((group) => enabledIds.has(group.id)).map((group) => {
+    const count = group.times.length
+    const overlaps = similarityKeepMode.value === 'both' ? keepCount * 2 >= count : keepCount >= count
+    if (overlaps) return { group, overlaps: true, removal: null as VideoSegment | null }
+    const startIndex = similarityKeepMode.value === 'back' ? 0 : keepCount
+    const endIndex = similarityKeepMode.value === 'front' ? count : count - keepCount
+    const afterGroupIndex = gridSequence.value.findIndex((item) => item.time === group.times[count - 1]) + 1
+    const end = endIndex < count ? group.times[endIndex] : (gridSequence.value[afterGroupIndex]?.time ?? videoDuration.value)
+    return { group, overlaps: false, removal: { start: group.times[startIndex], end } }
+  })
+})
+const smartRemovalRanges = computed(() => smartRemovalPlan.value
+  .flatMap((item) => item.removal ? [item.removal] : [])
+  .filter((range) => range.end > range.start)
+  .sort((a, b) => a.start - b.start)
+  .reduce<VideoSegment[]>((merged, range) => {
+    const previous = merged[merged.length - 1]
+    if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end)
+    else merged.push({ ...range })
+    return merged
+  }, []))
+const smartKeepSegments = computed(() => {
+  if (!videoDuration.value || !smartRemovalRanges.value.length) return []
+  const kept: VideoSegment[] = []
+  let cursor = 0
+  for (const removal of smartRemovalRanges.value) {
+    if (removal.start > cursor) kept.push({ start: cursor, end: removal.start })
+    cursor = Math.max(cursor, removal.end)
+  }
+  if (cursor < videoDuration.value) kept.push({ start: cursor, end: videoDuration.value })
+  return kept.filter((segment) => segment.end - segment.start >= 0.001)
+})
 
 function measureGrid() {
   const container = gridRef.value
@@ -325,6 +367,8 @@ function clearSimilarityAnalysis() {
   similarityGroups.value = []
   similarityAnalyzedCount.value = 0
   hoveredSimilarityGroup.value = null
+  selectedSimilarityGroupIds.value = []
+  showSmartReplaceConfirm.value = false
 }
 
 watch(videoPath, clearSimilarityAnalysis)
@@ -415,6 +459,7 @@ async function analyzeSimilarThumbnails() {
     finishGroup()
     if (runId !== similarityRunId) return
     similarityGroups.value = groups
+    selectedSimilarityGroupIds.value = groups.map((group) => group.id)
     similarityAnalyzedCount.value = sequence.length
     addLog(groups.length ? `相似縮圖分析完成：找到 ${groups.length} 個連續區段。` : '相似縮圖分析完成：沒有找到符合條件的連續區段。')
   } finally {
@@ -443,6 +488,7 @@ function similarityColorClass(groupId: number) {
 }
 
 function similarityItemClasses(time: number) {
+  if (!showSimilarityMarkers.value) return []
   const meta = similarityMetaByTime.value.get(time)
   if (!meta) return []
   return [
@@ -453,6 +499,30 @@ function similarityItemClasses(time: number) {
     hoveredSimilarityGroup.value !== null && hoveredSimilarityGroup.value !== meta.id ? 'similar-muted' : '',
     hoveredSimilarityGroup.value === meta.id ? 'similar-focused' : '',
   ]
+}
+
+function toggleSimilarityGroup(groupId: number) {
+  selectedSimilarityGroupIds.value = selectedSimilarityGroupIds.value.includes(groupId)
+    ? selectedSimilarityGroupIds.value.filter((id) => id !== groupId)
+    : [...selectedSimilarityGroupIds.value, groupId]
+}
+
+function applySmartKeepSegments() {
+  if (!smartRemovalRanges.value.length || !smartKeepSegments.value.length) return addLog('目前設定沒有需要排除的相似內容。')
+  mergeSegments.value = smartKeepSegments.value.map((segment) => ({ ...segment }))
+  mergeEditingIndex.value = null
+  selectedTimes.value = []
+  taskKind.value = 'merge'
+  activePanel.value = 'task'
+  similarityPanelOpen.value = false
+  showSmartReplaceConfirm.value = false
+  addLog(`已依相似縮圖建立 ${mergeSegments.value.length} 個合併片段草稿，排除 ${smartRemovalRanges.value.length} 個時間範圍。`)
+}
+
+function requestSmartKeepSegments() {
+  if (!smartRemovalRanges.value.length) return addLog('目前設定沒有需要排除的相似內容。')
+  if (mergeSegments.value.length) showSmartReplaceConfirm.value = true
+  else applySmartKeepSegments()
 }
 watch(gridRef, (element) => {
   gridResizeObserver?.disconnect()
@@ -1650,17 +1720,43 @@ function isInMergeSegment(time: number): boolean {
 
 function removeMergeSegment(index: number) {
   mergeSegments.value.splice(index, 1)
+  if (mergeEditingIndex.value === index) {
+    mergeEditingIndex.value = null
+    selectedTimes.value = []
+  } else if (mergeEditingIndex.value !== null && mergeEditingIndex.value > index) {
+    mergeEditingIndex.value -= 1
+  }
 }
 
-const dragFromIndex = ref<number | null>(null)
-function onSegmentDragStart(index: number) {
-  dragFromIndex.value = index
+function moveMergeSegment(index: number, direction: -1 | 1) {
+  const target = index + direction
+  if (target < 0 || target >= mergeSegments.value.length) return
+  const [segment] = mergeSegments.value.splice(index, 1)
+  mergeSegments.value.splice(target, 0, segment)
+  if (mergeEditingIndex.value === index) mergeEditingIndex.value = target
+  else if (mergeEditingIndex.value === target) mergeEditingIndex.value = index
 }
-function onSegmentDrop(index: number) {
-  if (dragFromIndex.value === null || dragFromIndex.value === index) return
-  const [moved] = mergeSegments.value.splice(dragFromIndex.value, 1)
-  mergeSegments.value.splice(index, 0, moved)
-  dragFromIndex.value = null
+
+function editMergeSegment(index: number) {
+  const segment = mergeSegments.value[index]
+  if (!segment) return
+  mergeEditingIndex.value = index
+  selectedTimes.value = [segment.start, segment.end]
+  const firstIndex = gridSequence.value.findIndex((item) => item.time === segment.start)
+  if (firstIndex >= 0) gridRef.value?.scrollTo({ top: Math.floor(firstIndex / gridColumnCount.value) * gridRowPitch.value, behavior: 'smooth' })
+}
+
+function applyMergeSegmentEdit() {
+  if (mergeEditingIndex.value === null || !selectedTimeRange.value) return
+  mergeSegments.value[mergeEditingIndex.value] = { ...selectedTimeRange.value }
+  addLog(`已更新合併片段 ${mergeEditingIndex.value + 1}。`)
+  mergeEditingIndex.value = null
+  selectedTimes.value = []
+}
+
+function cancelMergeSegmentEdit() {
+  mergeEditingIndex.value = null
+  selectedTimes.value = []
 }
 
 function roundPreviewTime(time: number) {
@@ -2209,21 +2305,26 @@ function createCombineTask() {
         </template>
 
         <template v-else>
-          <p class="info-text">在右側縮圖選擇任意兩個時間點，點「加入合併清單」加入片段；清單可拖曳調整順序，預設為加入順序。</p>
-          <div v-if="mergeSegments.length" class="merge-list">
+          <p class="info-text">在右側縮圖選擇任意兩個時間點加入片段；使用上下按鈕調整合併順序。</p>
+          <div v-if="mergeEditingIndex !== null" class="merge-edit-notice">
+            <span>正在編輯片段 {{ mergeEditingIndex + 1 }}，請在右側重新選擇頭尾時間，再按「套用到片段」。</span>
+            <button type="button" class="btn btn-secondary compact" @click="cancelMergeSegmentEdit">取消編輯</button>
+          </div>
+          <div v-if="mergeSegments.length" class="merge-list merge-segment-list">
             <div
               v-for="(segment, index) in mergeSegments"
               :key="index"
               class="merge-item"
-              draggable="true"
-              @dragstart="onSegmentDragStart(index)"
-              @dragover.prevent
-              @drop="onSegmentDrop(index)"
+              :class="{ editing: mergeEditingIndex === index }"
             >
-              <span class="merge-handle">⠿</span>
               <span class="merge-index">{{ index + 1 }}</span>
               <span class="merge-range">{{ formatSeconds(segment.start) }} → {{ formatSeconds(segment.end) }}</span>
-              <button class="merge-remove" @click="removeMergeSegment(index)">移除</button>
+              <div class="merge-item-actions">
+                <button class="merge-action" :disabled="index === 0" title="向上移動" @click="moveMergeSegment(index, -1)">↑</button>
+                <button class="merge-action" :disabled="index === mergeSegments.length - 1" title="向下移動" @click="moveMergeSegment(index, 1)">↓</button>
+                <button class="merge-action" @click="editMergeSegment(index)">編輯</button>
+                <button class="merge-remove" @click="removeMergeSegment(index)">移除</button>
+              </div>
             </div>
           </div>
           <p v-else class="selection-summary muted">尚未加入任何片段。</p>
@@ -2306,8 +2407,13 @@ function createCombineTask() {
           <template v-if="selectedTimeRange">
             <span class="row-divider">|</span>
             <span>已選擇範圍：{{ formatSeconds(selectedTimeRange.start) }} → {{ formatSeconds(selectedTimeRange.end) }}</span>
-            <button class="btn btn-danger compact" @click="removeSelectedPreviewRange">移除範圍內縮圖（含兩端）</button>
-            <button v-if="taskKind === 'merge'" class="btn btn-primary compact" @click="addSegmentToMergeList">＋ 加入合併清單</button>
+            <button v-if="mergeEditingIndex === null" class="btn btn-danger compact" @click="removeSelectedPreviewRange">移除範圍內縮圖（含兩端）</button>
+            <button v-if="taskKind === 'merge' && mergeEditingIndex === null" class="btn btn-primary compact" @click="addSegmentToMergeList">＋ 加入合併清單</button>
+          </template>
+          <template v-if="taskKind === 'merge' && mergeEditingIndex !== null">
+            <span v-if="!selectedTimeRange" class="merge-edit-selection-hint">{{ selectedTimes.length ? '已選新起點，請再選終點' : '請選擇新的起點與終點' }}</span>
+            <button class="btn btn-primary compact" :disabled="!selectedTimeRange" @click="applyMergeSegmentEdit">套用到片段 {{ mergeEditingIndex + 1 }}</button>
+            <button class="btn btn-secondary compact" @click="cancelMergeSegmentEdit">取消編輯</button>
           </template>
           <div ref="similarityPopoverWrap" class="similarity-tool">
             <button
@@ -2334,6 +2440,7 @@ function createCombineTask() {
                 <label>最少連續
                   <input v-model.number="similarityMinCount" :disabled="similarityAnalyzing" type="number" min="2" max="100" step="1" /> 張
                 </label>
+                <label class="similarity-marker-toggle"><input v-model="showSimilarityMarkers" type="checkbox" /> 顯示區段標記</label>
                 <button v-if="!similarityAnalyzing" type="button" class="btn btn-secondary compact" @click="analyzeSimilarThumbnails">分析相似縮圖</button>
                 <button v-else type="button" class="btn btn-danger compact" @click="cancelSimilarityAnalysis">取消分析（{{ similarityProgress }}%）</button>
                 <button v-if="similarityGroups.length && !similarityAnalyzing" type="button" class="btn-clear" @click="clearSimilarityAnalysis">清除結果</button>
@@ -2342,22 +2449,50 @@ function createCombineTask() {
               <p v-if="similarityResultOutdated" class="field-hint warning-text">縮圖數量已改變，目前標記可能已過期，建議重新分析。</p>
               <div v-if="similarityGroups.length" class="similarity-results">
                 <strong>找到 {{ similarityGroups.length }} 個相似區段</strong>
-                <button
+                <div
                   v-for="group in similarityGroups"
                   :key="group.id"
-                  type="button"
-                  class="similarity-result"
+                  class="similarity-result-wrap"
                   :class="similarityColorClass(group.id)"
                   @mouseenter="hoveredSimilarityGroup = group.id"
                   @mouseleave="hoveredSimilarityGroup = null"
-                  @focus="hoveredSimilarityGroup = group.id"
-                  @blur="hoveredSimilarityGroup = null"
-                  @click="selectSimilarityGroup(group)"
                 >
-                  <span>區段 {{ group.id }}</span>
-                  <span>{{ formatSeconds(group.times[0]) }} → {{ formatSeconds(group.times[group.times.length - 1]) }}</span>
-                  <span>{{ group.times.length }} 張・選取頭尾</span>
-                </button>
+                  <label class="similarity-result-check"><input type="checkbox" :checked="selectedSimilarityGroupIds.includes(group.id)" @change="toggleSimilarityGroup(group.id)" />套用</label>
+                  <button type="button" class="similarity-result" @focus="hoveredSimilarityGroup = group.id" @blur="hoveredSimilarityGroup = null" @click="selectSimilarityGroup(group)">
+                    <span>區段 {{ group.id }}</span>
+                    <span>{{ formatSeconds(group.times[0]) }} → {{ formatSeconds(group.times[group.times.length - 1]) }}</span>
+                    <span>{{ group.times.length }} 張・選取頭尾</span>
+                  </button>
+                </div>
+              </div>
+              <div v-if="similarityGroups.length" class="smart-removal-panel">
+                <strong>建立智慧合併草稿</strong>
+                <div class="smart-removal-controls">
+                  <label>保留方式
+                    <select v-model="similarityKeepMode">
+                      <option value="front">保留前段</option>
+                      <option value="back">保留後段</option>
+                      <option value="both">保留前後</option>
+                    </select>
+                  </label>
+                  <label>{{ similarityKeepMode === 'both' ? '前後各保留' : '保留' }}
+                    <input v-model.number="similarityKeepCount" type="number" min="1" max="100" step="1" /> 張
+                  </label>
+                  <button type="button" class="btn btn-primary compact" :disabled="!smartRemovalRanges.length" @click="requestSmartKeepSegments">建立合併片段草稿</button>
+                </div>
+                <div class="smart-removal-preview">
+                  <span v-if="!selectedSimilarityGroupIds.length">尚未勾選相似區段。</span>
+                  <template v-else>
+                    <span v-for="item in smartRemovalPlan" :key="item.group.id" :class="{ 'warning-text': item.overlaps }">
+                      區段 {{ item.group.id }}：{{ item.overlaps ? '保留範圍重疊，不移除' : `${formatSeconds(item.removal!.start)} → ${formatSeconds(item.removal!.end)}` }}
+                    </span>
+                  </template>
+                </div>
+                <div v-if="showSmartReplaceConfirm" class="smart-replace-confirm">
+                  <span>目前已有 {{ mergeSegments.length }} 個合併片段。要以智慧分析結果取代嗎？</span>
+                  <button type="button" class="btn btn-danger compact" @click="applySmartKeepSegments">取代現有片段</button>
+                  <button type="button" class="btn btn-secondary compact" @click="showSmartReplaceConfirm = false">取消</button>
+                </div>
               </div>
             </div>
           </div>
@@ -2387,7 +2522,7 @@ function createCombineTask() {
                   @click="toggleSelection(item.time)"
                   @dblclick="openModalForTime(item.time)"
                 >
-                  <div class="img-wrapper"><img v-if="item.src" :src="item.src" :alt="`縮圖 ${item.label}`" draggable="false" /><div v-else class="thumbnail-loading"><span></span><small>載入中</small></div><span v-if="item.endpoint" class="endpoint-label">{{ item.time === 0 ? '起點' : '終點' }}</span><span v-if="similarityMetaByTime.get(item.time)" class="similarity-badge">相似 {{ similarityMetaByTime.get(item.time)?.id }}</span></div>
+                  <div class="img-wrapper"><img v-if="item.src" :src="item.src" :alt="`縮圖 ${item.label}`" draggable="false" /><div v-else class="thumbnail-loading"><span></span><small>載入中</small></div><span v-if="item.endpoint" class="endpoint-label">{{ item.time === 0 ? '起點' : '終點' }}</span><span v-if="showSimilarityMarkers && similarityMetaByTime.get(item.time)" class="similarity-badge">相似 {{ similarityMetaByTime.get(item.time)?.id }}</span></div>
                   <div class="time-tag">{{ item.label }}</div>
                 </div>
               </div>
@@ -2919,6 +3054,13 @@ select:focus {
   gap: 0.5rem;
   margin: 0 0 1rem;
 }
+.merge-segment-list {
+  max-height: 320px;
+  padding-right: 0.35rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
 .batch-source-panel {
   display: flex;
   flex-direction: column;
@@ -2976,10 +3118,10 @@ select:focus {
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: rgba(15, 23, 42, 0.5);
-  cursor: grab;
 }
-.merge-item:active {
-  cursor: grabbing;
+.merge-item.editing {
+  border-color: #818cf8;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
 }
 .merge-handle {
   color: var(--text-muted);
@@ -3015,6 +3157,41 @@ select:focus {
   color: #fca5a5;
   font-size: 0.8rem;
   cursor: pointer;
+}
+.merge-item-actions {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 0.3rem;
+}
+.merge-action {
+  min-width: 1.8rem;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  color: #cbd5e1;
+  background: rgba(30, 41, 59, 0.75);
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.merge-action:hover:not(:disabled) { border-color: #818cf8; color: #fff; }
+.merge-action:disabled { opacity: 0.35; cursor: default; }
+.merge-edit-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid rgba(99, 102, 241, 0.45);
+  border-radius: 8px;
+  color: #c7d2fe;
+  background: rgba(99, 102, 241, 0.12);
+  font-size: 0.78rem;
+}
+.merge-edit-selection-hint {
+  color: #c7d2fe;
+  font-size: 0.78rem;
 }
 .expansion-queue {
   display: flex;
@@ -3420,6 +3597,11 @@ select:focus {
   width: 4rem;
   padding: 0.4rem 0.5rem;
 }
+.similarity-controls .similarity-marker-toggle input {
+  width: auto;
+  margin: 0;
+  padding: 0;
+}
 .similarity-progress {
   height: 5px;
   margin-top: 0.6rem;
@@ -3462,9 +3644,76 @@ select:focus {
   text-align: left;
   cursor: pointer;
 }
+.similarity-result-wrap {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid var(--similar-color);
+  border-radius: 7px;
+  background: var(--similar-bg);
+}
+.similarity-result-wrap .similarity-result {
+  border: 0;
+  border-radius: 0;
+}
+.similarity-result-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.35rem 0.45rem;
+  border-right: 1px solid var(--similar-color);
+  color: #fff;
+  font-size: 0.68rem;
+  cursor: pointer;
+}
+.similarity-result-check input { width: auto; margin: 0; }
 .similarity-result:hover {
   box-shadow: 0 0 0 2px var(--similar-soft);
   filter: brightness(1.15);
+}
+.smart-removal-panel {
+  margin-top: 0.7rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+}
+.smart-removal-panel > strong { color: #e2e8f0; font-size: 0.82rem; }
+.smart-removal-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.55rem;
+  margin-top: 0.5rem;
+}
+.smart-removal-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+.smart-removal-controls select { width: auto; min-width: 7rem; padding: 0.4rem 0.5rem; }
+.smart-removal-controls input { width: 3.8rem; padding: 0.4rem 0.5rem; }
+.smart-removal-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.8rem;
+  margin-top: 0.55rem;
+  color: #cbd5e1;
+  font: 0.7rem ui-monospace, monospace;
+}
+.smart-replace-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  padding: 0.55rem;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: 7px;
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.3);
+  font-size: 0.75rem;
 }
 .warning-text { color: #fbbf24; }
 .row-divider {

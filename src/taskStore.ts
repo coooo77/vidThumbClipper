@@ -42,6 +42,10 @@ export interface VideoTask {
   combineMode: CombineMode
   status: TaskStatus
   message: string
+  /** Unix time in milliseconds when the most recent execution actually began. */
+  lastRunStartedAt?: number
+  /** Wall-clock duration in milliseconds for the most recent completed, failed, or cancelled execution. */
+  lastRunDurationMs?: number
   // Only timeline metadata is persisted. Thumbnail image data is intentionally excluded so even
   // very large previews do not consume hundreds of megabytes on disk.
   previewTimeline?: TaskPreviewTimeline
@@ -74,6 +78,8 @@ try {
         status: '等待中',
         message: '上次程式關閉時此任務仍在處理，已安全移回等待佇列，請確認輸出檔案後再重新執行。',
         progress: undefined,
+        lastRunStartedAt: undefined,
+        lastRunDurationMs: undefined,
       }
     : task)
 } catch {

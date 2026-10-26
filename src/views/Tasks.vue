@@ -99,6 +99,15 @@ function formatDuration(seconds: number) {
   if (minutes) return `${minutes} 分 ${remainingSeconds} 秒`
   return `${remainingSeconds} 秒`
 }
+function formatTaskRunDuration(milliseconds: number) {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000))
+  if (seconds < 60) return `${seconds} 秒`
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const remainingSeconds = seconds % 60
+  const clock = `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`
+  return hours ? `${String(hours).padStart(2, '0')}:${clock}` : clock
+}
 function nextClockStartAt() {
   const start = new Date()
   start.setHours(scheduledHour.value, scheduledMinute.value, scheduledSecond.value, 0)
@@ -361,6 +370,8 @@ function retryTask(task: VideoTask) {
   task.status = '等待中'
   task.message = ''
   task.progress = undefined
+  task.lastRunStartedAt = undefined
+  task.lastRunDurationMs = undefined
   task.resultPath = ''
   if (pendingEditTaskId.value === task.id) pendingEditTaskId.value = null
 }
@@ -534,6 +545,8 @@ async function runTasks() {
       if (!(await ensureEnoughDiskSpace(task))) break
       if (stopBatchRequested.value) break
       processedAny = true
+      task.lastRunStartedAt = Date.now()
+      task.lastRunDurationMs = undefined
       task.status = '處理中'
       try {
         if (task.kind === 'clip') await runClipTask(task)
@@ -555,6 +568,8 @@ async function runTasks() {
           hadFailure = true
           if (trigger === 'each') notifyResult(false)
         }
+      } finally {
+        if (task.lastRunStartedAt) task.lastRunDurationMs = Math.max(0, Date.now() - task.lastRunStartedAt)
       }
       if (stopBatchRequested.value) break
     }
@@ -695,13 +710,13 @@ async function runTasks() {
             <p v-else class="range-empty">這筆舊任務沒有保存可展開的實際範圍，執行時會依影片長度計算。</p>
           </div>
           <p class="task-file-name truncate w-full" :title="`${task.outputName}.${task.extension}`">{{ task.outputName }}.{{ task.extension }}</p>
-          <div v-if="task.progress" class="task-progress">
+          <div v-if="task.progress || task.lastRunDurationMs !== undefined" class="task-progress">
             <div class="task-progress-meta">
-              <span>{{ task.progress.label }}</span>
+              <span v-if="task.progress">{{ task.progress.label }}</span>
               <span v-if="task.status === '處理中'">{{ taskProgressPercent(task) }}% · 已執行 {{ formatDuration(taskElapsedSeconds(task)) }} · {{ taskEtaText(task) }}</span>
-              <span v-else-if="task.status === '完成'">100%</span>
+              <span v-else-if="task.lastRunDurationMs !== undefined">{{ task.status === '完成' ? '100% · ' : '' }}總處理時間 {{ formatTaskRunDuration(task.lastRunDurationMs) }}</span>
             </div>
-            <div class="task-progress-track" :class="{ indeterminate: task.status === '處理中' && task.progress.completed === 0 }">
+            <div v-if="task.progress" class="task-progress-track" :class="{ indeterminate: task.status === '處理中' && task.progress.completed === 0 }">
               <span :style="{ width: `${taskProgressPercent(task)}%` }"></span>
             </div>
           </div>
